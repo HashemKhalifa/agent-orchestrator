@@ -72,6 +72,13 @@ npm --prefix packages/orchestrator-standalone run cli -- eval-golden
 npm --prefix packages/orchestrator-standalone run cli -- dag-run \
   --manifest generated/orchestration/dag/manifest.json \
   --provider-preset claude-subscription
+
+# Load generated recipe JSON directly
+npm --prefix packages/orchestrator-standalone run cli -- auto-run \
+  --goal-type test_runner_migration \
+  --recipe-file generated/orchestration/recipes/autogen-jest-vitest.json \
+  --provider-preset claude-subscription \
+  --apply-mode dry-run
 ```
 
 ## Built-in Recipes (v1)
@@ -113,3 +120,17 @@ Artifacts per cycle:
 - Apply mode supports stronger controls: wave approvals (`--approvals-dir`), evidence file requirement (`--evidence-file`), and rollback readiness command (`--rollback-check-command`).
 - Executor abstraction supports Codex and Claude profiles (`--executor-profile codex-safe|claude-safe`), provider presets (`--provider-preset codex|claude|claude-subscription|openai|anthropic`), and custom templates.
 - RAG retrieval uses hybrid BM25 + embedding scoring with tunable weights.
+
+## Provider Presets
+
+- `--provider-preset codex`: uses `codex-safe`
+- `--provider-preset claude` or `--provider-preset claude-subscription`: uses `claude-safe`
+- `--provider-preset openai`: routes through OpenAI executor settings
+- `--provider-preset anthropic`: routes through Anthropic executor settings
+
+Preset helper scripts:
+- `scripts/run-request-dag-with-provider.sh`
+- `scripts/executors/codex.sh`
+- `scripts/executors/claude.sh`
+- `scripts/executors/openai.sh`
+- `scripts/executors/anthropic.sh`

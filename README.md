@@ -96,3 +96,39 @@ Quick DAG run with provider preset:
 ```bash
 bash scripts/run-request-dag-with-provider.sh --provider-preset claude-subscription
 ```
+
+## Claude Subscription Setup
+
+1. Authenticate Claude CLI once (subscription account session).
+2. Run orchestration with the subscription preset:
+
+```bash
+bash scripts/run-bot-request-until-done.sh \
+  --goal-type dependency_upgrade \
+  --recipe-id react18-to-react19 \
+  --provider-preset claude-subscription \
+  --auto-recipe \
+  --apply-mode dry-run
+```
+
+3. Promote to apply mode only with explicit safeguards:
+
+```bash
+bash scripts/run-bot-request-until-done.sh \
+  --goal-type dependency_upgrade \
+  --recipe-id react18-to-react19 \
+  --provider-preset claude-subscription \
+  --apply-mode apply \
+  --apply-guard-token ALLOW_APPLY \
+  --evidence-file generated/orchestration/evidence/apply-evidence.md \
+  --rollback-check-command "npm run test:run"
+```
+
+## Skills
+
+Core migration/orchestration skills are in `.codex/skills`, including:
+- `claude-orchestration`
+- `claude-webpack-rsbuild`
+- `claude-react19-upgrade`
+- `claude-jest-to-vitest`
+- `recipe-autogen`
