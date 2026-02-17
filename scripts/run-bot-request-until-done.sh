@@ -20,6 +20,7 @@ MAX_FILES=3000
 EXECUTOR_PROFILE="codex-safe"
 EXECUTOR_PROVIDER=""
 PROVIDER_TEMPLATE=""
+PROVIDER_PRESET=""
 EXECUTOR_TEMPLATE=""
 APPLY_MODE="dry-run"
 APPLY_GUARD_TOKEN=""
@@ -37,6 +38,36 @@ SKILLS_DIR=".codex/skills/generated"
 MIN_OCCURRENCES=2
 JSON_OUT=""
 CURATED_DOMAINS=()
+
+apply_provider_preset() {
+  local preset="$1"
+  case "$preset" in
+    codex)
+      EXECUTOR_PROFILE="codex-safe"
+      EXECUTOR_PROVIDER=""
+      PROVIDER_TEMPLATE=""
+      ;;
+    claude|claude-subscription)
+      EXECUTOR_PROFILE="claude-safe"
+      EXECUTOR_PROVIDER=""
+      PROVIDER_TEMPLATE=""
+      ;;
+    openai)
+      EXECUTOR_PROFILE="none"
+      EXECUTOR_PROVIDER="custom"
+      PROVIDER_TEMPLATE="bash scripts/executors/openai.sh {moduleId} {title} {partFile} {requestPath}"
+      ;;
+    anthropic)
+      EXECUTOR_PROFILE="none"
+      EXECUTOR_PROVIDER="custom"
+      PROVIDER_TEMPLATE="bash scripts/executors/anthropic.sh {moduleId} {title} {partFile} {requestPath}"
+      ;;
+    *)
+      echo "ERROR: --provider-preset must be codex, claude, claude-subscription, openai, or anthropic" >&2
+      exit 1
+      ;;
+  esac
+}
 
 print_help() {
   cat <<'USAGE'
@@ -66,6 +97,8 @@ Planning/discovery options:
   --max-tasks <n>                 Max synthesized tasks (default: 24)
 
 Execution options:
+  --provider-preset <preset>     codex|claude|claude-subscription|openai|anthropic
+  --claude-subscription          Alias for --provider-preset claude-subscription
   --executor-profile <profile>    none|codex-safe|claude-safe (default: codex-safe)
   --executor-provider <provider>  codex|claude|custom (optional)
   --provider-template <cmd>       Template for custom provider ({prompt}, {moduleId}, {title}, {partFile})
@@ -150,6 +183,16 @@ while [[ $# -gt 0 ]]; do
     --max-tasks)
       MAX_TASKS="${2:-}"
       shift 2
+      ;;
+    --provider-preset)
+      PROVIDER_PRESET="${2:-}"
+      apply_provider_preset "$PROVIDER_PRESET"
+      shift 2
+      ;;
+    --claude-subscription)
+      PROVIDER_PRESET="claude-subscription"
+      apply_provider_preset "$PROVIDER_PRESET"
+      shift
       ;;
     --executor-profile)
       EXECUTOR_PROFILE="${2:-}"

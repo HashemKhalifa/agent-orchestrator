@@ -19,6 +19,7 @@ You can also package `packages/orchestrator-standalone` and publish/install it a
 - `packages/orchestrator-standalone` - core package (spec, adapters, kernel, recipes, CLI)
 - `scripts/run-standalone-orchestrator-until-done.sh` - run-until-done controller
 - `scripts/run-bot-request-until-done.sh` - autonomous discovery -> RAG -> DAG -> execute loop
+- `scripts/run-request-dag-with-provider.sh` - run DAG with provider presets (codex/claude/openai/anthropic)
 - `unpack.config.ts` - request-splitting strategy config used by DAG compiler
 - `.codex/skills` - reusable Codex skills (system + project skills)
 
@@ -65,9 +66,15 @@ Claude-backed execution (provider abstraction):
 bash scripts/run-bot-request-until-done.sh \
   --goal-type dependency_upgrade \
   --recipe-id react18-to-react19 \
-  --executor-profile claude-safe \
+  --provider-preset claude-subscription \
   --apply-mode dry-run
 ```
+
+Provider preset matrix:
+- `codex`: `--provider-preset codex`
+- `claude`/subscription: `--provider-preset claude-subscription`
+- `openai` wrapper: `--provider-preset openai`
+- `anthropic` wrapper: `--provider-preset anthropic`
 
 Automate recipe authoring from discovery + run memory:
 
@@ -82,4 +89,10 @@ Deterministic golden suite:
 
 ```bash
 npm --prefix packages/orchestrator-standalone run cli -- eval-golden
+```
+
+Quick DAG run with provider preset:
+
+```bash
+bash scripts/run-request-dag-with-provider.sh --provider-preset claude-subscription
 ```

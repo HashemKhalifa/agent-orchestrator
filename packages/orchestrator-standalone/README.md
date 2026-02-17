@@ -52,6 +52,13 @@ npm --prefix packages/orchestrator-standalone run cli -- auto-run \
   --executor-profile codex-safe \
   --apply-mode dry-run
 
+# Claude subscription preset
+npm --prefix packages/orchestrator-standalone run cli -- auto-run \
+  --goal-type dependency_upgrade \
+  --recipe-id react18-to-react19 \
+  --provider-preset claude-subscription \
+  --apply-mode dry-run
+
 # Auto-generate a recipe from discovery + historical run memory
 npm --prefix packages/orchestrator-standalone run cli -- recipe-generate \
   --goal-type dependency_upgrade \
@@ -60,6 +67,11 @@ npm --prefix packages/orchestrator-standalone run cli -- recipe-generate \
 
 # Golden deterministic evaluation suite
 npm --prefix packages/orchestrator-standalone run cli -- eval-golden
+
+# Provider preset shortcut
+npm --prefix packages/orchestrator-standalone run cli -- dag-run \
+  --manifest generated/orchestration/dag/manifest.json \
+  --provider-preset claude-subscription
 ```
 
 ## Built-in Recipes (v1)
@@ -99,5 +111,5 @@ Artifacts per cycle:
 - Root-level `unpack.config.ts` enables custom split rules for large request files.
 - `dag-run --apply-mode apply` is guard-protected; pass `--apply-guard-token ALLOW_APPLY` (or custom guard value) explicitly.
 - Apply mode supports stronger controls: wave approvals (`--approvals-dir`), evidence file requirement (`--evidence-file`), and rollback readiness command (`--rollback-check-command`).
-- Executor abstraction supports Codex and Claude profiles (`--executor-profile codex-safe|claude-safe`) plus custom provider templates.
+- Executor abstraction supports Codex and Claude profiles (`--executor-profile codex-safe|claude-safe`), provider presets (`--provider-preset codex|claude|claude-subscription|openai|anthropic`), and custom templates.
 - RAG retrieval uses hybrid BM25 + embedding scoring with tunable weights.

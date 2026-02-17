@@ -95,6 +95,33 @@ function parseExecutorProvider(value: string | undefined): "codex" | "claude" | 
   throw new Error("--executor-provider must be codex, claude, or custom");
 }
 
+function parseProviderPreset(value: string | undefined): {
+  executorProfile?: "none" | "codex-safe" | "claude-safe";
+  executorProvider?: "codex" | "claude" | "custom";
+  providerTemplate?: string;
+} {
+  if (!value) return {};
+  if (value === "codex") {
+    return { executorProfile: "codex-safe" };
+  }
+  if (value === "claude" || value === "claude-subscription") {
+    return { executorProfile: "claude-safe" };
+  }
+  if (value === "openai") {
+    return {
+      executorProfile: "none",
+      executorProvider: "codex",
+    };
+  }
+  if (value === "anthropic") {
+    return {
+      executorProfile: "none",
+      executorProvider: "claude",
+    };
+  }
+  throw new Error("--provider-preset must be codex, claude, claude-subscription, openai, or anthropic");
+}
+
 function loadRecipeFile(workspaceRoot: string, recipeFile: string) {
   const absolute = path.isAbsolute(recipeFile) ? recipeFile : path.resolve(workspaceRoot, recipeFile);
   const parsed = JSON.parse(readFileSync(absolute, "utf8"));
@@ -173,6 +200,8 @@ function printHelp(): void {
   process.stdout.write(`  --executor <cmd-template>    placeholders: {id} {title} {partFile} {requestPath}\n`);
   process.stdout.write(`  --executor-profile <none|codex-safe|claude-safe>\n`);
   process.stdout.write(`  --executor-provider <codex|claude|custom>\n`);
+  process.stdout.write(`  --provider-preset <codex|claude|claude-subscription|openai|anthropic>\n`);
+  process.stdout.write(`  --claude-subscription        alias for --provider-preset claude-subscription\n`);
   process.stdout.write(`  --provider-template <cmd-template> placeholders: {prompt} {moduleId} {title} {partFile}\n`);
   process.stdout.write(`  --apply-mode <dry-run|apply> (dag-run; default: dry-run)\n`);
   process.stdout.write(`  --apply-guard-token <token>  (required for apply mode unless matching default guard)\n`);
@@ -592,8 +621,15 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     throw new Error("--fail-policy must be graph or global");
   }
 
-  const executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "none") as string);
-  const executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
+  let executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "none") as string);
+  let executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
+  let providerTemplateRaw = option(args, "provider-template");
+  const preset = parseProviderPreset(
+    flag(args, "claude-subscription") ? "claude-subscription" : option(args, "provider-preset"),
+  );
+  if (preset.executorProfile) executorProfileRaw = preset.executorProfile;
+  if (preset.executorProvider !== undefined) executorProviderRaw = preset.executorProvider;
+  if (preset.providerTemplate) providerTemplateRaw = preset.providerTemplate;
 
   const applyModeRaw = option(args, "apply-mode", "dry-run");
   if (applyModeRaw !== "dry-run" && applyModeRaw !== "apply") {
@@ -608,7 +644,7 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     executorTemplate: option(args, "executor"),
     executorProfile: executorProfileRaw,
     executorProvider: executorProviderRaw,
-    providerTemplate: option(args, "provider-template"),
+    providerTemplate: providerTemplateRaw,
     applyMode: applyModeRaw,
     applyGuardToken: option(args, "apply-guard-token"),
     applyGuardValue: option(args, "apply-guard-value"),
@@ -732,8 +768,15 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     dependencyMode: DagDependencyModeSchema.parse(option(args, "dependency", "staged")),
   });
 
-  const executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "codex-safe") as string);
-  const executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
+  let executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "codex-safe") as string);
+  let executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
+  let providerTemplateRaw = option(args, "provider-template");
+  const preset = parseProviderPreset(
+    flag(args, "claude-subscription") ? "claude-subscription" : option(args, "provider-preset"),
+  );
+  if (preset.executorProfile) executorProfileRaw = preset.executorProfile;
+  if (preset.executorProvider !== undefined) executorProviderRaw = preset.executorProvider;
+  if (preset.providerTemplate) providerTemplateRaw = preset.providerTemplate;
 
   const applyModeRaw = option(args, "apply-mode", "dry-run");
   if (applyModeRaw !== "dry-run" && applyModeRaw !== "apply") {
@@ -751,7 +794,7 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     executorTemplate: option(args, "executor"),
     executorProfile: executorProfileRaw,
     executorProvider: executorProviderRaw,
-    providerTemplate: option(args, "provider-template"),
+    providerTemplate: providerTemplateRaw,
     applyMode: applyModeRaw,
     applyGuardToken: option(args, "apply-guard-token"),
     applyGuardValue: option(args, "apply-guard-value"),
