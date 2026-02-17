@@ -8,6 +8,7 @@ cd "$ROOT_DIR"
 
 GOAL_TYPE=""
 RECIPE_ID=""
+RECIPE_FILE=""
 MODE="dry-run"
 WORKSPACE_ROOT="."
 RUNS_DIR="generated/orchestration/standalone/runs"
@@ -21,6 +22,11 @@ WAVE_STRATEGY=""
 REQUIRE_TDD_TESTS=true
 RUN_ID=""
 JSON_OUT=""
+APPROVALS_DIR=""
+REQUIRE_WAVE_APPROVAL=true
+EVIDENCE_FILE=""
+REQUIRE_EVIDENCE_FILE=true
+ROLLBACK_CHECK_COMMAND=""
 
 CURATED_DOMAINS=()
 
@@ -30,10 +36,11 @@ run-standalone-orchestrator-until-done.sh
 
 Usage:
   ./scripts/run-standalone-orchestrator-until-done.sh --goal-type <type> --recipe-id <id> [options]
+  ./scripts/run-standalone-orchestrator-until-done.sh --goal-type <type> --recipe-file <path> [options]
 
 Required:
   --goal-type <build_migration|dependency_upgrade|ci_refactor|test_runner_migration|custom>
-  --recipe-id <recipe-id>
+  --recipe-id <recipe-id> | --recipe-file <path>
 
 Options:
   --mode <dry-run|apply>         Execution mode (default: dry-run)
@@ -49,6 +56,11 @@ Options:
   --curated-domain <domain>      Curated secondary allowlist domain (repeatable)
   --no-require-tdd-tests         Disable mandatory test-tool gate
   --run-id <id>                  Resume/continue a specific run id
+  --approvals-dir <path>         Apply approvals dir
+  --no-require-wave-approval     Disable apply wave approval requirement
+  --evidence-file <path>         Apply evidence file path
+  --no-require-evidence-file     Disable apply evidence requirement
+  --rollback-check-command <cmd> Command that must pass before apply mode
   --json-out <path>              Final summary JSON output path
   -h, --help                     Show help
 USAGE
@@ -62,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --recipe-id)
       RECIPE_ID="${2:-}"
+      shift 2
+      ;;
+    --recipe-file)
+      RECIPE_FILE="${2:-}"
       shift 2
       ;;
     --mode)
@@ -116,6 +132,26 @@ while [[ $# -gt 0 ]]; do
       RUN_ID="${2:-}"
       shift 2
       ;;
+    --approvals-dir)
+      APPROVALS_DIR="${2:-}"
+      shift 2
+      ;;
+    --no-require-wave-approval)
+      REQUIRE_WAVE_APPROVAL=false
+      shift
+      ;;
+    --evidence-file)
+      EVIDENCE_FILE="${2:-}"
+      shift 2
+      ;;
+    --no-require-evidence-file)
+      REQUIRE_EVIDENCE_FILE=false
+      shift
+      ;;
+    --rollback-check-command)
+      ROLLBACK_CHECK_COMMAND="${2:-}"
+      shift 2
+      ;;
     --json-out)
       JSON_OUT="${2:-}"
       shift 2
@@ -132,8 +168,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$GOAL_TYPE" || -z "$RECIPE_ID" ]]; then
-  echo "ERROR: --goal-type and --recipe-id are required" >&2
+if [[ -z "$GOAL_TYPE" ]]; then
+  echo "ERROR: --goal-type is required" >&2
+  exit 1
+fi
+
+if [[ -z "$RECIPE_ID" && -z "$RECIPE_FILE" ]]; then
+  echo "ERROR: either --recipe-id or --recipe-file is required" >&2
   exit 1
 fi
 
@@ -264,7 +305,6 @@ for ((cycle=1; cycle<=MAX_CYCLES; cycle++)); do
     npm --prefix packages/orchestrator-standalone run cli --
     cycle
     --goal-type "$GOAL_TYPE"
-    --recipe-id "$RECIPE_ID"
     --workspace-root "$WORKSPACE_ROOT"
     --runs-dir "$RUNS_DIR"
     --mode "$MODE"
@@ -273,8 +313,36 @@ for ((cycle=1; cycle<=MAX_CYCLES; cycle++)); do
     --json-out "$CYCLE_JSON_PATH"
   )
 
+  if [[ -n "$RECIPE_ID" ]]; then
+    CMD+=(--recipe-id "$RECIPE_ID")
+  fi
+
+  if [[ -n "$RECIPE_FILE" ]]; then
+    CMD+=(--recipe-file "$RECIPE_FILE")
+  fi
+
   if [[ -n "$RUN_ID" ]]; then
     CMD+=(--run-id "$RUN_ID")
+  fi
+
+  if [[ -n "$APPROVALS_DIR" ]]; then
+    CMD+=(--approvals-dir "$APPROVALS_DIR")
+  fi
+
+  if [[ "$REQUIRE_WAVE_APPROVAL" == "false" ]]; then
+    CMD+=(--no-require-wave-approval)
+  fi
+
+  if [[ -n "$EVIDENCE_FILE" ]]; then
+    CMD+=(--evidence-file "$EVIDENCE_FILE")
+  fi
+
+  if [[ "$REQUIRE_EVIDENCE_FILE" == "false" ]]; then
+    CMD+=(--no-require-evidence-file)
+  fi
+
+  if [[ -n "$ROLLBACK_CHECK_COMMAND" ]]; then
+    CMD+=(--rollback-check-command "$ROLLBACK_CHECK_COMMAND")
   fi
 
   if [[ -n "$WAVE_STRATEGY" ]]; then

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { buildEmbedding, toTermCounts, toTermFrequency, tokenize } from "./hybrid.js";
 import { RagIndexSchema, type RagChunk, type RagIndex } from "./types.js";
 
 const IGNORE_DIRS = new Set([
@@ -38,16 +39,6 @@ const DEFAULT_EXTENSIONS = new Set([
   ".md",
   ".sql",
   ".sh",
-]);
-
-const STOP_WORDS = new Set([
-  "the", "and", "for", "that", "with", "this", "from", "are", "was", "were", "will",
-  "have", "has", "had", "into", "onto", "your", "you", "our", "their", "they", "them",
-  "then", "than", "when", "where", "what", "which", "while", "does", "did", "done",
-  "just", "also", "very", "much", "many", "more", "less", "some", "any", "not", "can",
-  "could", "should", "would", "about", "after", "before", "during", "over", "under",
-  "true", "false", "null", "undefined", "const", "let", "var", "function", "return",
-  "import", "export", "class", "type", "interface", "public", "private", "static",
 ]);
 
 function collectFiles(args: {
@@ -96,29 +87,14 @@ function collectFiles(args: {
   return out;
 }
 
-function tokenize(text: string): string[] {
-  const matches = text.toLowerCase().match(/[a-z][a-z0-9_\-]{1,}/g) ?? [];
-  const out: string[] = [];
-  for (const token of matches) {
-    if (STOP_WORDS.has(token)) continue;
-    out.push(token);
-  }
-  return out;
-}
+function pruneTermCounts(termCounts: Record<string, number>, maxTerms: number): Record<string, number> {
+  const entries = Object.entries(termCounts);
+  if (entries.length <= maxTerms) return termCounts;
 
-function termFrequency(tokens: string[], topTerms = 120): Record<string, number> {
-  if (tokens.length === 0) return {};
-
-  const freq = new Map<string, number>();
-  for (const token of tokens) {
-    freq.set(token, (freq.get(token) ?? 0) + 1);
-  }
-
-  const sorted = Array.from(freq.entries()).sort((a, b) => b[1] - a[1]).slice(0, topTerms);
-  const total = tokens.length;
+  const trimmed = entries.sort((a, b) => b[1] - a[1]).slice(0, maxTerms);
   const out: Record<string, number> = {};
-  for (const [term, count] of sorted) {
-    out[term] = count / total;
+  for (const [term, count] of trimmed) {
+    out[term] = count;
   }
   return out;
 }
@@ -128,6 +104,8 @@ function splitIntoChunks(args: {
   workspaceRoot: string;
   linesPerChunk: number;
   maxCharsPerChunk: number;
+  embeddingDims: number;
+  maxTermsPerChunk: number;
 }): RagChunk[] {
   let content = "";
   try {
@@ -154,7 +132,9 @@ function splitIntoChunks(args: {
     }
 
     const tokens = tokenize(text);
+    const tokenCount = tokens.length;
     const relPath = path.relative(args.workspaceRoot, args.filePath).replace(/\\/g, "/");
+    const termCounts = pruneTermCounts(toTermCounts(tokens), args.maxTermsPerChunk);
 
     chunks.push({
       id: `${relPath}#${chunkId}`,
@@ -162,8 +142,10 @@ function splitIntoChunks(args: {
       startLine: start + 1,
       endLine: end,
       text,
-      tokenCount: tokens.length,
-      termFreq: termFrequency(tokens),
+      tokenCount,
+      termCounts,
+      termFreq: toTermFrequency(termCounts, tokenCount),
+      embedding: buildEmbedding(termCounts, args.embeddingDims),
     });
 
     chunkId += 1;
@@ -178,6 +160,8 @@ export function buildRagIndex(args: {
   maxFiles?: number;
   linesPerChunk?: number;
   maxCharsPerChunk?: number;
+  embeddingDims?: number;
+  maxTermsPerChunk?: number;
 }): RagIndex {
   const workspaceRoot = path.resolve(args.workspaceRoot);
   const files = collectFiles({
@@ -185,6 +169,7 @@ export function buildRagIndex(args: {
     maxFiles: args.maxFiles ?? 3000,
   });
 
+  const embeddingDims = Math.max(8, args.embeddingDims ?? 96);
   const chunks: RagChunk[] = [];
   for (const filePath of files) {
     const fileChunks = splitIntoChunks({
@@ -192,6 +177,8 @@ export function buildRagIndex(args: {
       workspaceRoot,
       linesPerChunk: args.linesPerChunk ?? 120,
       maxCharsPerChunk: args.maxCharsPerChunk ?? 5000,
+      embeddingDims,
+      maxTermsPerChunk: args.maxTermsPerChunk ?? 180,
     });
     for (const chunk of fileChunks) {
       if (chunk.tokenCount > 0) chunks.push(chunk);
@@ -200,7 +187,7 @@ export function buildRagIndex(args: {
 
   const df = new Map<string, number>();
   for (const chunk of chunks) {
-    const seen = new Set(Object.keys(chunk.termFreq));
+    const seen = new Set(Object.keys(chunk.termCounts));
     for (const term of seen) {
       df.set(term, (df.get(term) ?? 0) + 1);
     }
@@ -211,6 +198,10 @@ export function buildRagIndex(args: {
     vocabularyDf[term] = count;
   }
 
+  const avgDocLength = chunks.length > 0
+    ? chunks.reduce((sum, chunk) => sum + chunk.tokenCount, 0) / chunks.length
+    : 1;
+
   return RagIndexSchema.parse({
     schemaVersion: "1.0",
     generatedAt: new Date().toISOString(),
@@ -218,6 +209,9 @@ export function buildRagIndex(args: {
     fileCount: files.length,
     chunkCount: chunks.length,
     vocabularyDf,
+    avgDocLength,
+    embeddingDims,
+    retrievalMode: "hybrid_bm25_embedding",
     chunks,
   });
 }

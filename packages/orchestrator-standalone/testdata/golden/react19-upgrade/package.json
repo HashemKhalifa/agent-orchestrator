@@ -1,0 +1,12 @@
+{
+  "name": "golden-react19-upgrade",
+  "private": true,
+  "dependencies": {
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:run": "vitest run"
+  }
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "webpack-rsbuild",
+    "goalType": "build_migration",
+    "recipeId": "webpack-to-rsbuild-incremental",
+    "query": "webpack rsbuild plugin compatibility",
+    "expected": {
+      "buildTools": ["webpack"],
+      "topHitPathIncludes": "src/main.ts"
+    }
+  },
+  {
+    "id": "react19-upgrade",
+    "goalType": "dependency_upgrade",
+    "recipeId": "react18-to-react19",
+    "query": "ReactDOM.render hydration createRoot",
+    "expected": {
+      "testTools": ["vitest"],
+      "topHitPathIncludes": "main.tsx"
+    }
+  },
+  {
+    "id": "jest-vitest",
+    "goalType": "test_runner_migration",
+    "recipeId": "jest-to-vitest",
+    "query": "jest globals vitest migration",
+    "expected": {
+      "testTools": ["jest", "vitest"],
+      "topHitPathIncludes": "package.json"
+    }
+  }
+]

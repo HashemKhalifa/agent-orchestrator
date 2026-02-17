@@ -2,6 +2,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
+  ExecutionRecipeSchema,
+  GoalTypeSchema,
   OrchestrationGoalSchema,
   SourcePolicySchema,
   RiskGateModeSchema,
@@ -9,6 +11,8 @@ import {
   ExecutionPlanSchema,
 } from "./spec/schemas.js";
 import { getRecipeById, getRecipeCatalog } from "./recipes/catalog.js";
+import { generateRecipeFromContext } from "./recipes/generator.js";
+import { applyRecipeMemory, deriveRecipeMemory } from "./recipes/memory.js";
 import { discoverWorkspaceFacts, summarizeWorkspaceFacts } from "./adapters/workspace-discovery.js";
 import { collectInternetEvidence } from "./adapters/internet-evidence.js";
 import { getRunStatus, runOrchestrationCycle, validatePlan } from "./kernel/orchestrator.js";
@@ -20,6 +24,7 @@ import { loadRagIndex, queryRagIndex } from "./rag/retriever.js";
 import { startRagServer } from "./rag/server.js";
 import { synthesizeTaskRequest } from "./autonomy/task-synthesizer.js";
 import { autoGenerateSkills } from "./skills/autogen.js";
+import { runGoldenEvaluation } from "./eval/golden.js";
 
 interface ParsedArgs {
   command: string;
@@ -77,6 +82,25 @@ function parseNumber(args: ParsedArgs, key: string, fallback: number): number {
   return n;
 }
 
+function parseExecutorProfile(value: string): "none" | "codex-safe" | "claude-safe" {
+  if (value === "none" || value === "codex-safe" || value === "claude-safe") {
+    return value;
+  }
+  throw new Error("--executor-profile must be none, codex-safe, or claude-safe");
+}
+
+function parseExecutorProvider(value: string | undefined): "codex" | "claude" | "custom" | undefined {
+  if (!value) return undefined;
+  if (value === "codex" || value === "claude" || value === "custom") return value;
+  throw new Error("--executor-provider must be codex, claude, or custom");
+}
+
+function loadRecipeFile(workspaceRoot: string, recipeFile: string) {
+  const absolute = path.isAbsolute(recipeFile) ? recipeFile : path.resolve(workspaceRoot, recipeFile);
+  const parsed = JSON.parse(readFileSync(absolute, "utf8"));
+  return ExecutionRecipeSchema.parse(parsed);
+}
+
 function defaultWorkspaceRoot(): string {
   return process.env.INIT_CWD ? path.resolve(process.env.INIT_CWD) : ".";
 }
@@ -97,6 +121,7 @@ function printHelp(): void {
   process.stdout.write(`orchestrator standalone CLI\n\n`);
   process.stdout.write(`Commands:\n`);
   process.stdout.write(`  recipes                              List available recipe ids\n`);
+  process.stdout.write(`  recipe-generate [options]            Generate recipe JSON from discovery + memory\n`);
   process.stdout.write(`  discover --recipe-id <id> [options]  Run local+internet discovery\n`);
   process.stdout.write(`  plan --goal-type <type> --recipe-id <id> [options]\n`);
   process.stdout.write(`  validate --plan <path>               Validate a plan artifact\n`);
@@ -111,6 +136,7 @@ function printHelp(): void {
   process.stdout.write(`  dag-run --manifest <path> [options]\n`);
   process.stdout.write(`  skills-autogen --manifest <path> [options]\n`);
   process.stdout.write(`  auto-run --goal-type <type> --recipe-id <id> [options]\n\n`);
+  process.stdout.write(`  eval-golden [options]                Run deterministic golden fixture suite\n\n`);
 
   process.stdout.write(`Common options:\n`);
   process.stdout.write(`  --workspace-root <path>      (default: INIT_CWD or .)\n`);
@@ -118,6 +144,7 @@ function printHelp(): void {
   process.stdout.write(`  --run-id <id>\n`);
   process.stdout.write(`  --runs-dir <path>            (default: generated/orchestration/standalone/runs)\n`);
   process.stdout.write(`  --mode dry-run|apply         (recipe cycle mode; default: dry-run)\n`);
+  process.stdout.write(`  --recipe-file <path>         load recipe from JSON instead of catalog id\n`);
   process.stdout.write(`  --source-policy primary_only|primary_plus_curated_secondary|open_web\n`);
   process.stdout.write(`  --risk-gate-mode strict_blockers|warn_then_apply|manual_override\n`);
   process.stdout.write(`  --wave-strategy incremental_dual_build|pilot_wave|big_bang|custom\n`);
@@ -131,6 +158,10 @@ function printHelp(): void {
   process.stdout.write(`  --max-files <n>              (rag-index; default: 3000)\n`);
   process.stdout.write(`  --lines-per-chunk <n>        (rag-index; default: 120)\n`);
   process.stdout.write(`  --max-chars-per-chunk <n>    (rag-index; default: 5000)\n`);
+  process.stdout.write(`  --embedding-dims <n>         (rag-index; default: 96)\n`);
+  process.stdout.write(`  --max-terms-per-chunk <n>    (rag-index; default: 180)\n`);
+  process.stdout.write(`  --bm25-weight <n>            (rag-query; default: 0.75)\n`);
+  process.stdout.write(`  --embedding-weight <n>       (rag-query; default: 0.25)\n`);
   process.stdout.write(`  --host <addr>                (rag-serve; default: 127.0.0.1)\n`);
   process.stdout.write(`  --port <n>                   (rag-serve; default: 8787)\n\n`);
 
@@ -140,10 +171,17 @@ function printHelp(): void {
   process.stdout.write(`  --output-dir <path>          (dag-compile; default: generated/orchestration/dag)\n`);
   process.stdout.write(`  --manifest <path>            (dag-run / skills-autogen)\n`);
   process.stdout.write(`  --executor <cmd-template>    placeholders: {id} {title} {partFile} {requestPath}\n`);
-  process.stdout.write(`  --executor-profile <none|codex-safe>\n`);
+  process.stdout.write(`  --executor-profile <none|codex-safe|claude-safe>\n`);
+  process.stdout.write(`  --executor-provider <codex|claude|custom>\n`);
+  process.stdout.write(`  --provider-template <cmd-template> placeholders: {prompt} {moduleId} {title} {partFile}\n`);
   process.stdout.write(`  --apply-mode <dry-run|apply> (dag-run; default: dry-run)\n`);
   process.stdout.write(`  --apply-guard-token <token>  (required for apply mode unless matching default guard)\n`);
   process.stdout.write(`  --apply-guard-value <token>  (default guard is ALLOW_APPLY)\n`);
+  process.stdout.write(`  --approvals-dir <path>       apply approvals dir (default: generated/orchestration/approvals)\n`);
+  process.stdout.write(`  --no-require-wave-approval   disable per-wave approval requirement in apply mode\n`);
+  process.stdout.write(`  --evidence-file <path>       apply evidence file (default: generated/orchestration/evidence/apply-evidence.md)\n`);
+  process.stdout.write(`  --no-require-evidence-file   disable evidence-file requirement in apply mode\n`);
+  process.stdout.write(`  --rollback-check-command <c> command that must pass before apply mode proceeds\n`);
   process.stdout.write(`  --fail-policy <graph|global> (default: graph)\n`);
   process.stdout.write(`  --timeout-ms <n>             command timeout\n`);
   process.stdout.write(`  --dry-run                    skip executing module commands in dag-run\n\n`);
@@ -160,14 +198,36 @@ function printHelp(): void {
   process.stdout.write(`  --apply-skills               write generated skills\n`);
   process.stdout.write(`  --auto-skills <off|suggest|apply> (auto-run; default: suggest)\n`);
   process.stdout.write(`  --autonomy-dir <path>        (auto-run output root; default: generated/orchestration/autonomy)\n`);
+  process.stdout.write(`  --auto-recipe                (auto-run: generate recipe from discovery + memory)\n`);
+  process.stdout.write(`  --auto-recipe-id <id>        (auto-run: id for generated recipe)\n`);
+  process.stdout.write(`  --recipe-output <path>       (recipe-generate output; default: generated/orchestration/recipes/<id>.json)\n`);
+  process.stdout.write(`  --base-recipe-id <id>        (recipe-generate; seed from existing recipe)\n`);
+  process.stdout.write(`  --include-internet <bool>    (recipe-generate; default: true)\n`);
+  process.stdout.write(`  --fixtures-dir <path>        (eval-golden fixtures root)\n`);
+  process.stdout.write(`  --allow-failed true          (eval-golden: do not throw on failures)\n`);
 }
 
-function parseGoal(args: ParsedArgs): ReturnType<typeof OrchestrationGoalSchema.parse> {
+function parseGoal(args: ParsedArgs): {
+  goal: ReturnType<typeof OrchestrationGoalSchema.parse>;
+  recipeOverride: ReturnType<typeof ExecutionRecipeSchema.parse> | undefined;
+} {
   const goalType = option(args, "goal-type");
   const recipeId = option(args, "recipe-id");
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const recipeFile = option(args, "recipe-file");
 
-  if (!goalType || !recipeId) {
-    throw new Error("--goal-type and --recipe-id are required");
+  if (!goalType) {
+    throw new Error("--goal-type is required");
+  }
+
+  let recipeOverride: ReturnType<typeof ExecutionRecipeSchema.parse> | undefined;
+  if (recipeFile) {
+    recipeOverride = loadRecipeFile(workspaceRoot, recipeFile);
+  }
+
+  const resolvedRecipeId = recipeOverride?.id ?? recipeId;
+  if (!resolvedRecipeId) {
+    throw new Error("--recipe-id (or --recipe-file) is required");
   }
 
   const sourcePolicy = SourcePolicySchema.parse(option(args, "source-policy", "primary_plus_curated_secondary"));
@@ -175,18 +235,91 @@ function parseGoal(args: ParsedArgs): ReturnType<typeof OrchestrationGoalSchema.
   const waveStrategyRaw = option(args, "wave-strategy");
   const waveStrategy = waveStrategyRaw ? WaveStrategySchema.parse(waveStrategyRaw) : undefined;
 
-  return OrchestrationGoalSchema.parse({
+  if (recipeOverride && recipeOverride.goalType !== goalType) {
+    throw new Error(
+      `Goal type '${goalType}' does not match recipe-file goal type '${recipeOverride.goalType}'.`,
+    );
+  }
+
+  return {
+    goal: OrchestrationGoalSchema.parse({
+      goalType,
+      recipeId: resolvedRecipeId,
+      workspaceRoot,
+      sourceSystem: option(args, "source-system"),
+      targetSystem: option(args, "target-system"),
+      sourcePolicy,
+      riskGateMode,
+      waveStrategy,
+      requireTddTests: flag(args, "no-require-tdd-tests") ? false : true,
+      curatedSourceDomains: optionList(args, "curated-domain"),
+    }),
+    recipeOverride,
+  };
+}
+
+function resolveRecipe(args: ParsedArgs, workspaceRoot: string): ReturnType<typeof ExecutionRecipeSchema.parse> {
+  const recipeFile = option(args, "recipe-file");
+  if (recipeFile) {
+    return loadRecipeFile(workspaceRoot, recipeFile);
+  }
+
+  const recipeId = option(args, "recipe-id");
+  if (!recipeId) {
+    throw new Error("--recipe-id (or --recipe-file) is required");
+  }
+  return getRecipeById(recipeId);
+}
+
+async function commandRecipeGenerate(args: ParsedArgs): Promise<void> {
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const goalType = GoalTypeSchema.parse(option(args, "goal-type", "custom"));
+  const recipeId = option(args, "recipe-id", `autogen-${goalType}-${Date.now()}`) as string;
+  const outputPath = option(args, "recipe-output", `generated/orchestration/recipes/${recipeId}.json`) as string;
+
+  const result = await generateRecipeFromContext({
+    workspaceRoot,
     goalType,
     recipeId,
-    workspaceRoot: option(args, "workspace-root", defaultWorkspaceRoot()),
-    sourceSystem: option(args, "source-system"),
-    targetSystem: option(args, "target-system"),
-    sourcePolicy,
-    riskGateMode,
-    waveStrategy,
-    requireTddTests: flag(args, "no-require-tdd-tests") ? false : true,
-    curatedSourceDomains: optionList(args, "curated-domain"),
+    title: option(args, "title"),
+    description: option(args, "description"),
+    baseRecipeId: option(args, "base-recipe-id"),
+    discoveryPath: option(args, "discovery-file"),
+    runsDir: option(args, "runs-dir", "generated/orchestration/standalone/runs"),
+    sourcePolicy: SourcePolicySchema.parse(option(args, "source-policy", "primary_plus_curated_secondary")),
+    curatedDomains: optionList(args, "curated-domain"),
+    includeInternet: option(args, "include-internet", "true") !== "false",
+    outputPath,
   });
+
+  writeJson(option(args, "json-out"), {
+    recipeId: result.recipe.id,
+    outputPath: result.outputPath,
+    baseRecipeId: result.baseRecipeId,
+    summary: result.summary,
+    memory: result.memory
+      ? {
+        analyzedRuns: result.memory.analyzedRuns,
+        learnedRiskProbes: result.memory.learnedRiskProbes.map((probe) => probe.id),
+        learnedGates: result.memory.learnedGates.map((gate) => gate.id),
+      }
+      : null,
+  }, workspaceRoot);
+}
+
+async function commandEvalGolden(args: ParsedArgs): Promise<void> {
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const result = await runGoldenEvaluation({
+    fixturesDir: option(args, "fixtures-dir"),
+    topK: parseNumber(args, "top-k", 5),
+  });
+
+  if (result.failed > 0 && option(args, "allow-failed", "false") !== "true") {
+    writeJson(option(args, "json-out"), result, workspaceRoot);
+    throw new Error(`Golden suite failed: ${result.failed}/${result.total} scenarios failing.`);
+  }
+
+  writeJson(option(args, "json-out"), result, workspaceRoot);
 }
 
 async function commandRecipes(args: ParsedArgs): Promise<void> {
@@ -200,11 +333,8 @@ async function commandRecipes(args: ParsedArgs): Promise<void> {
 }
 
 async function commandDiscover(args: ParsedArgs): Promise<void> {
-  const recipeId = option(args, "recipe-id");
-  if (!recipeId) throw new Error("--recipe-id is required for discover");
-
   const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
-  const recipe = getRecipeById(recipeId);
+  const recipe = resolveRecipe(args, workspaceRoot);
   const sourcePolicy = SourcePolicySchema.parse(option(args, "source-policy", "primary_plus_curated_secondary"));
 
   const facts = discoverWorkspaceFacts(workspaceRoot);
@@ -227,12 +357,23 @@ async function commandDiscover(args: ParsedArgs): Promise<void> {
 }
 
 async function commandPlan(args: ParsedArgs): Promise<void> {
-  const goal = parseGoal(args);
+  const { goal, recipeOverride } = parseGoal(args);
   const mode = option(args, "mode", "dry-run") as "dry-run" | "apply";
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const runId = option(args, "run-id");
 
-  const cycle = await runOrchestrationCycle({ runId, goal, mode, runsDir });
+  const cycle = await runOrchestrationCycle({
+    runId,
+    goal,
+    mode,
+    runsDir,
+    recipeOverride,
+    requireWaveApproval: flag(args, "no-require-wave-approval") ? false : undefined,
+    approvalsDir: option(args, "approvals-dir"),
+    requireEvidenceFile: flag(args, "no-require-evidence-file") ? false : undefined,
+    evidenceFile: option(args, "evidence-file"),
+    rollbackCheckCommand: option(args, "rollback-check-command"),
+  });
   writeJson(option(args, "json-out"), {
     runId: cycle.runId,
     plan: cycle.plan,
@@ -252,12 +393,23 @@ async function commandValidate(args: ParsedArgs): Promise<void> {
 }
 
 async function commandExecute(args: ParsedArgs): Promise<void> {
-  const goal = parseGoal(args);
+  const { goal, recipeOverride } = parseGoal(args);
   const mode = option(args, "mode", "dry-run") as "dry-run" | "apply";
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const runId = option(args, "run-id");
 
-  const cycle = await runOrchestrationCycle({ runId, goal, mode, runsDir });
+  const cycle = await runOrchestrationCycle({
+    runId,
+    goal,
+    mode,
+    runsDir,
+    recipeOverride,
+    requireWaveApproval: flag(args, "no-require-wave-approval") ? false : undefined,
+    approvalsDir: option(args, "approvals-dir"),
+    requireEvidenceFile: flag(args, "no-require-evidence-file") ? false : undefined,
+    evidenceFile: option(args, "evidence-file"),
+    rollbackCheckCommand: option(args, "rollback-check-command"),
+  });
   writeJson(option(args, "json-out"), {
     runId: cycle.runId,
     execution: cycle.execution,
@@ -268,12 +420,23 @@ async function commandExecute(args: ParsedArgs): Promise<void> {
 }
 
 async function commandCycle(args: ParsedArgs): Promise<void> {
-  const goal = parseGoal(args);
+  const { goal, recipeOverride } = parseGoal(args);
   const mode = option(args, "mode", "dry-run") as "dry-run" | "apply";
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const runId = option(args, "run-id");
 
-  const cycle = await runOrchestrationCycle({ runId, goal, mode, runsDir });
+  const cycle = await runOrchestrationCycle({
+    runId,
+    goal,
+    mode,
+    runsDir,
+    recipeOverride,
+    requireWaveApproval: flag(args, "no-require-wave-approval") ? false : undefined,
+    approvalsDir: option(args, "approvals-dir"),
+    requireEvidenceFile: flag(args, "no-require-evidence-file") ? false : undefined,
+    evidenceFile: option(args, "evidence-file"),
+    rollbackCheckCommand: option(args, "rollback-check-command"),
+  });
   writeJson(option(args, "json-out"), {
     runId: cycle.runId,
     summary: cycle.cycleSummary,
@@ -302,6 +465,8 @@ async function commandRagIndex(args: ParsedArgs): Promise<void> {
     maxFiles: parseNumber(args, "max-files", 3000),
     linesPerChunk: parseNumber(args, "lines-per-chunk", 120),
     maxCharsPerChunk: parseNumber(args, "max-chars-per-chunk", 5000),
+    embeddingDims: parseNumber(args, "embedding-dims", 96),
+    maxTermsPerChunk: parseNumber(args, "max-terms-per-chunk", 180),
   });
 
   const savedPath = saveRagIndex({
@@ -332,6 +497,8 @@ async function commandRagQuery(args: ParsedArgs): Promise<void> {
     query,
     topK: parseNumber(args, "top-k", 8),
     filePathIncludes: option(args, "path"),
+    bm25Weight: parseNumber(args, "bm25-weight", 0.75),
+    embeddingWeight: parseNumber(args, "embedding-weight", 0.25),
   });
 
   writeJson(option(args, "json-out"), result, workspaceRoot);
@@ -361,7 +528,7 @@ async function commandRagServe(args: ParsedArgs): Promise<void> {
 }
 
 async function commandSynthesizeTasks(args: ParsedArgs): Promise<void> {
-  const goal = parseGoal(args);
+  const { goal, recipeOverride } = parseGoal(args);
   const workspaceRoot = goal.workspaceRoot;
   const requestOut = option(args, "request-out", "generated/orchestration/autonomy/request.generated.md") as string;
 
@@ -369,6 +536,7 @@ async function commandSynthesizeTasks(args: ParsedArgs): Promise<void> {
     workspaceRoot,
     goalType: goal.goalType,
     recipeId: goal.recipeId,
+    recipe: recipeOverride,
     discoveryPath: option(args, "discovery-file"),
     ragIndexPath: option(args, "rag-index"),
     outputPath: requestOut,
@@ -424,10 +592,8 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     throw new Error("--fail-policy must be graph or global");
   }
 
-  const executorProfileRaw = option(args, "executor-profile", "none");
-  if (executorProfileRaw !== "none" && executorProfileRaw !== "codex-safe") {
-    throw new Error("--executor-profile must be none or codex-safe");
-  }
+  const executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "none") as string);
+  const executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
 
   const applyModeRaw = option(args, "apply-mode", "dry-run");
   if (applyModeRaw !== "dry-run" && applyModeRaw !== "apply") {
@@ -441,9 +607,16 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     manifestPath,
     executorTemplate: option(args, "executor"),
     executorProfile: executorProfileRaw,
+    executorProvider: executorProviderRaw,
+    providerTemplate: option(args, "provider-template"),
     applyMode: applyModeRaw,
     applyGuardToken: option(args, "apply-guard-token"),
     applyGuardValue: option(args, "apply-guard-value"),
+    approvalDir: option(args, "approvals-dir"),
+    requireWaveApproval: flag(args, "no-require-wave-approval") ? false : undefined,
+    evidenceFilePath: option(args, "evidence-file"),
+    requireEvidenceFile: flag(args, "no-require-evidence-file") ? false : undefined,
+    rollbackCheckCommand: option(args, "rollback-check-command"),
     failPolicy: failPolicyRaw,
     timeoutMs,
     outputPath: option(args, "json-out"),
@@ -477,7 +650,7 @@ async function commandSkillsAutogen(args: ParsedArgs): Promise<void> {
 }
 
 async function commandAutoRun(args: ParsedArgs): Promise<void> {
-  const goal = parseGoal(args);
+  const { goal, recipeOverride } = parseGoal(args);
   const workspaceRoot = goal.workspaceRoot;
   const autonomyDir = option(args, "autonomy-dir", "generated/orchestration/autonomy") as string;
 
@@ -488,7 +661,12 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
   const dagManifestPath = path.resolve(workspaceRoot, dagOutputDir, "manifest.json");
   const dagRunSummaryPath = path.resolve(workspaceRoot, autonomyDir, "dag", "run-summary.json");
 
-  const recipe = getRecipeById(goal.recipeId);
+  const baseRecipe = recipeOverride ?? getRecipeById(goal.recipeId);
+  const memory = deriveRecipeMemory({
+    runsDir: path.resolve(workspaceRoot, option(args, "runs-dir", "generated/orchestration/standalone/runs") as string),
+    recipeId: baseRecipe.id,
+  });
+  let recipe = applyRecipeMemory({ recipe: baseRecipe, memory });
   const facts = discoverWorkspaceFacts(workspaceRoot);
   const evidence = await collectInternetEvidence({
     sources: recipe.discoverySources,
@@ -507,6 +685,29 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     workspaceRoot,
   );
 
+  const autoRecipeEnabled = flag(args, "auto-recipe");
+  let generatedRecipePath: string | null = null;
+  if (autoRecipeEnabled) {
+    const autoRecipeId = option(args, "auto-recipe-id", `${recipe.id}-autogen`) as string;
+    const recipeOutputPath = option(args, "recipe-output", `${autonomyDir}/recipe.generated.json`) as string;
+    const generated = await generateRecipeFromContext({
+      workspaceRoot,
+      goalType: goal.goalType,
+      recipeId: autoRecipeId,
+      baseRecipeId: recipeOverride ? undefined : goal.recipeId,
+      discoveryPath,
+      runsDir: path.resolve(workspaceRoot, option(args, "runs-dir", "generated/orchestration/standalone/runs") as string),
+      sourcePolicy: goal.sourcePolicy,
+      curatedDomains: goal.curatedSourceDomains,
+      includeInternet: false,
+      outputPath: recipeOutputPath,
+    });
+    recipe = generated.recipe;
+    generatedRecipePath = generated.outputPath
+      ? path.relative(workspaceRoot, generated.outputPath).replace(/\\/g, "/")
+      : null;
+  }
+
   const ragIndex = buildRagIndex({
     workspaceRoot,
     maxFiles: parseNumber(args, "max-files", 3000),
@@ -517,6 +718,7 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     workspaceRoot,
     goalType: goal.goalType,
     recipeId: goal.recipeId,
+    recipe,
     discoveryPath,
     ragIndexPath,
     outputPath: path.relative(workspaceRoot, requestPath),
@@ -530,14 +732,17 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     dependencyMode: DagDependencyModeSchema.parse(option(args, "dependency", "staged")),
   });
 
-  const executorProfileRaw = option(args, "executor-profile", "codex-safe");
-  if (executorProfileRaw !== "none" && executorProfileRaw !== "codex-safe") {
-    throw new Error("--executor-profile must be none or codex-safe");
-  }
+  const executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "codex-safe") as string);
+  const executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
 
   const applyModeRaw = option(args, "apply-mode", "dry-run");
   if (applyModeRaw !== "dry-run" && applyModeRaw !== "apply") {
     throw new Error("--apply-mode must be dry-run or apply");
+  }
+
+  const failPolicyRaw = option(args, "fail-policy", "graph");
+  if (failPolicyRaw !== "graph" && failPolicyRaw !== "global") {
+    throw new Error("--fail-policy must be graph or global");
   }
 
   const dagSummary = runDag({
@@ -545,10 +750,17 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     manifestPath: path.relative(workspaceRoot, dagManifestPath),
     executorTemplate: option(args, "executor"),
     executorProfile: executorProfileRaw,
+    executorProvider: executorProviderRaw,
+    providerTemplate: option(args, "provider-template"),
     applyMode: applyModeRaw,
     applyGuardToken: option(args, "apply-guard-token"),
     applyGuardValue: option(args, "apply-guard-value"),
-    failPolicy: (option(args, "fail-policy", "graph") as "graph" | "global"),
+    approvalDir: option(args, "approvals-dir"),
+    requireWaveApproval: flag(args, "no-require-wave-approval") ? false : undefined,
+    evidenceFilePath: option(args, "evidence-file"),
+    requireEvidenceFile: flag(args, "no-require-evidence-file") ? false : undefined,
+    rollbackCheckCommand: option(args, "rollback-check-command"),
+    failPolicy: failPolicyRaw,
     timeoutMs: parseNumber(args, "timeout-ms", 10 * 60 * 1000),
     outputPath: path.relative(workspaceRoot, dagRunSummaryPath),
     dryRun: flag(args, "dry-run"),
@@ -572,6 +784,18 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
 
   const summary = {
     goal,
+    recipe: {
+      id: recipe.id,
+      title: recipe.title,
+      riskProbeCount: recipe.riskProbes.length,
+      gateCount: recipe.gates.length,
+      memory: {
+        analyzedRuns: memory.analyzedRuns,
+        learnedRiskProbes: memory.learnedRiskProbes.map((probe) => probe.id),
+        learnedGates: memory.learnedGates.map((gate) => gate.id),
+      },
+      generatedRecipePath,
+    },
     artifacts: {
       discoveryPath: path.relative(workspaceRoot, discoveryPath).replace(/\\/g, "/"),
       ragIndexPath: path.relative(workspaceRoot, ragIndexPath).replace(/\\/g, "/"),
@@ -599,6 +823,12 @@ async function main(): Promise<void> {
       return;
     case "recipes":
       await commandRecipes(parsed);
+      return;
+    case "recipe-generate":
+      await commandRecipeGenerate(parsed);
+      return;
+    case "eval-golden":
+      await commandEvalGolden(parsed);
       return;
     case "discover":
       await commandDiscover(parsed);

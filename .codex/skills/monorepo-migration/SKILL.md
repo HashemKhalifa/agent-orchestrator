@@ -21,10 +21,25 @@ npm --prefix packages/orchestrator-standalone run cli -- discover --recipe-id <r
 npm --prefix packages/orchestrator-standalone run cli -- cycle --goal-type <goal-type> --recipe-id <recipe-id> --mode dry-run
 ```
 
-3. Until done loop:
+3. Optional: auto-generate recipe from current discovery + memory:
+
+```bash
+npm --prefix packages/orchestrator-standalone run cli -- recipe-generate \
+  --goal-type <goal-type> \
+  --recipe-id <autogen-recipe-id> \
+  --recipe-output generated/orchestration/recipes/<autogen-recipe-id>.json
+```
+
+4. Until done loop:
 
 ```bash
 bash scripts/run-standalone-orchestrator-until-done.sh --goal-type <goal-type> --recipe-id <recipe-id>
+```
+
+5. Validate deterministic suite before broad rollout:
+
+```bash
+npm --prefix packages/orchestrator-standalone run cli -- eval-golden
 ```
 
 ## Safety

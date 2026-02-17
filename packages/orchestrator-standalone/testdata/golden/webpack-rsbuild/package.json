@@ -1,0 +1,9 @@
+{
+  "name": "golden-webpack-rsbuild",
+  "private": true,
+  "scripts": {
+    "build": "webpack",
+    "typecheck": "tsc --noEmit",
+    "test:run": "vitest run"
+  }
+}

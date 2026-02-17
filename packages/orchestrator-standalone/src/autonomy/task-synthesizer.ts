@@ -3,6 +3,7 @@ import path from "node:path";
 import { getRecipeById } from "../recipes/catalog.js";
 import { discoverWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import { loadRagIndex, queryRagIndex } from "../rag/retriever.js";
+import { ExecutionRecipeSchema, type ExecutionRecipe } from "../spec/schemas.js";
 
 interface DiscoveryPayload {
   recipeId?: string;
@@ -95,13 +96,14 @@ export function synthesizeTaskRequest(args: {
   workspaceRoot: string;
   goalType: string;
   recipeId: string;
+  recipe?: ExecutionRecipe;
   discoveryPath?: string;
   ragIndexPath?: string;
   outputPath: string;
   maxTasks?: number;
 }): { requestPath: string; taskCount: number } {
   const workspaceRoot = path.resolve(args.workspaceRoot);
-  const recipe = getRecipeById(args.recipeId);
+  const recipe = args.recipe ? ExecutionRecipeSchema.parse(args.recipe) : getRecipeById(args.recipeId);
   const discovery = readDiscoveryFile(args.discoveryPath);
   const workspaceFacts = discovery.workspaceFacts ?? discoverWorkspaceFacts(workspaceRoot);
 

@@ -75,4 +75,80 @@ describe("request DAG compile/run", () => {
       }),
     ).toThrow(/Apply mode blocked/);
   });
+
+  it("supports claude-safe executor profile", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-core-dag-claude-"));
+    cleanupPaths.push(root);
+
+    writeFileSync(path.join(root, "request.md"), "# Req\n\n## Task\nDo it.\n", "utf8");
+
+    await compileRequestDag({
+      workspaceRoot: root,
+      requestPath: "request.md",
+      outputDir: "generated/orchestration/dag",
+      dependencyMode: "staged",
+    });
+
+    const summary = runDag({
+      workspaceRoot: root,
+      manifestPath: "generated/orchestration/dag/manifest.json",
+      executorProfile: "claude-safe",
+      dryRun: true,
+    });
+
+    expect(summary.results.length).toBeGreaterThan(0);
+    expect(summary.results[0].command).toContain("claude -p");
+  });
+
+  it("blocks apply when wave approval is missing", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-core-dag-approval-"));
+    cleanupPaths.push(root);
+
+    writeFileSync(path.join(root, "request.md"), "# Req\n\n## Task\nDo it.\n", "utf8");
+    await compileRequestDag({
+      workspaceRoot: root,
+      requestPath: "request.md",
+      outputDir: "generated/orchestration/dag",
+      dependencyMode: "staged",
+    });
+
+    writeFileSync(path.join(root, "evidence.md"), "evidence", "utf8");
+
+    const summary = runDag({
+      workspaceRoot: root,
+      manifestPath: "generated/orchestration/dag/manifest.json",
+      executorTemplate: "echo ok",
+      applyMode: "apply",
+      applyGuardToken: "ALLOW_APPLY",
+      evidenceFilePath: "evidence.md",
+      dryRun: false,
+    });
+
+    expect(summary.status).toBe("partial_failure");
+    expect(summary.results.every((result) => result.status === "blocked")).toBe(true);
+    expect(summary.results[0].stderr).toContain("wave approval missing");
+  });
+
+  it("blocks apply when evidence file is missing", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-core-dag-evidence-"));
+    cleanupPaths.push(root);
+
+    writeFileSync(path.join(root, "request.md"), "# Req\n\n## Task\nDo it.\n", "utf8");
+    await compileRequestDag({
+      workspaceRoot: root,
+      requestPath: "request.md",
+      outputDir: "generated/orchestration/dag",
+      dependencyMode: "staged",
+    });
+
+    expect(() =>
+      runDag({
+        workspaceRoot: root,
+        manifestPath: "generated/orchestration/dag/manifest.json",
+        executorTemplate: "echo ok",
+        applyMode: "apply",
+        applyGuardToken: "ALLOW_APPLY",
+      }),
+    ).toThrow(/missing evidence file/i);
+  });
 });

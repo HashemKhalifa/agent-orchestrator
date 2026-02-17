@@ -24,6 +24,7 @@ import {
 import { discoverWorkspaceFacts, summarizeWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import { collectInternetEvidence } from "../adapters/internet-evidence.js";
 import { getRecipeById } from "../recipes/catalog.js";
+import { applyRecipeMemory, deriveRecipeMemory, type RecipeMemory } from "../recipes/memory.js";
 import {
   loadRunState,
   persistCycleArtifacts,
@@ -450,6 +451,19 @@ function runCommand(command: string, cwd: string, timeoutMs: number): { passed: 
   };
 }
 
+function isApprovalFileApproved(filePath: string): boolean {
+  if (!existsSync(filePath)) return false;
+  try {
+    const raw = readFileSync(filePath, "utf8").trim();
+    if (!raw) return false;
+    if (raw.toLowerCase() === "approved") return true;
+    const parsed = JSON.parse(raw);
+    return parsed?.approved === true;
+  } catch {
+    return false;
+  }
+}
+
 function evaluateGates(args: {
   plan: ExecutionPlan;
   timeoutMs: number;
@@ -560,6 +574,11 @@ export function executePlan(args: {
   mode: "dry-run" | "apply";
   state: RunState;
   timeoutMs: number;
+  requireWaveApproval?: boolean;
+  approvalsDir?: string;
+  requireEvidenceFile?: boolean;
+  evidenceFile?: string;
+  rollbackCheckCommand?: string;
 }): ExecutionReport {
   const now = new Date().toISOString();
 
@@ -599,6 +618,87 @@ export function executePlan(args: {
       pendingWaves: [],
       blockerSummary: requiredFailed.map((gate) => `${gate.gateId}: ${gate.details}`),
     });
+  }
+
+  if (args.mode === "apply") {
+    const requireEvidenceFile = args.requireEvidenceFile ?? true;
+    if (requireEvidenceFile) {
+      const evidenceFile = path.resolve(
+        args.plan.workspaceFacts.repoRoot,
+        args.evidenceFile ?? "generated/orchestration/evidence/apply-evidence.md",
+      );
+      if (!existsSync(evidenceFile)) {
+        return ExecutionReportSchema.parse({
+          orchestratorSpecVersion: "1.0.0",
+          runId: args.plan.runId,
+          planId: args.plan.planId,
+          executedAt: now,
+          mode: args.mode,
+          status: "blocked",
+          done: false,
+          waveResult: null,
+          gateResults: [],
+          pendingWaves: args.plan.waves
+            .map((wave) => wave.id)
+            .filter((waveId) => !args.state.completedWaves.includes(waveId)),
+          blockerSummary: [
+            `Apply evidence file missing: ${path.relative(args.plan.workspaceFacts.repoRoot, evidenceFile)}`,
+          ],
+        });
+      }
+    }
+
+    if (args.rollbackCheckCommand) {
+      const rollbackCheck = runCommand(
+        args.rollbackCheckCommand,
+        args.plan.workspaceFacts.repoRoot,
+        args.timeoutMs,
+      );
+      if (!rollbackCheck.passed) {
+        return ExecutionReportSchema.parse({
+          orchestratorSpecVersion: "1.0.0",
+          runId: args.plan.runId,
+          planId: args.plan.planId,
+          executedAt: now,
+          mode: args.mode,
+          status: "blocked",
+          done: false,
+          waveResult: null,
+          gateResults: [],
+          pendingWaves: args.plan.waves
+            .map((wave) => wave.id)
+            .filter((waveId) => !args.state.completedWaves.includes(waveId)),
+          blockerSummary: [`Rollback check command failed: ${rollbackCheck.detail}`],
+        });
+      }
+    }
+
+    if (args.requireWaveApproval ?? true) {
+      const approvalFile = path.resolve(
+        args.plan.workspaceFacts.repoRoot,
+        args.approvalsDir ?? "generated/orchestration/approvals",
+        `${currentWave.id}.approved.json`,
+      );
+      if (!isApprovalFileApproved(approvalFile)) {
+        return ExecutionReportSchema.parse({
+          orchestratorSpecVersion: "1.0.0",
+          runId: args.plan.runId,
+          planId: args.plan.planId,
+          executedAt: now,
+          mode: args.mode,
+          status: "blocked",
+          done: false,
+          waveResult: null,
+          gateResults: [],
+          pendingWaves: args.plan.waves
+            .map((wave) => wave.id)
+            .filter((waveId) => !args.state.completedWaves.includes(waveId)),
+          blockerSummary: [
+            `Wave approval missing for ${currentWave.id}: ${path.relative(args.plan.workspaceFacts.repoRoot, approvalFile)}`,
+          ],
+        });
+      }
+    }
   }
 
   const notes: string[] = [];
@@ -688,6 +788,7 @@ function summarizeCycle(args: {
   validation: ReturnType<typeof ValidationReportSchema.parse>;
   execution: ExecutionReport;
   state: RunState;
+  recipeMemory?: RecipeMemory | null;
 }): Record<string, unknown> {
   return {
     orchestratorSpecVersion: "1.0.0",
@@ -702,6 +803,13 @@ function summarizeCycle(args: {
     pendingWaves: args.execution.pendingWaves,
     completedWaves: args.state.completedWaves,
     blockers: args.execution.blockerSummary,
+    recipeMemory: args.recipeMemory
+      ? {
+        analyzedRuns: args.recipeMemory.analyzedRuns,
+        learnedRiskProbes: args.recipeMemory.learnedRiskProbes.map((probe) => probe.id),
+        learnedGates: args.recipeMemory.learnedGates.map((gate) => gate.id),
+      }
+      : null,
     artifacts: {
       planPath: args.state.lastPlanPath,
       validationPath: args.state.lastValidationPath,
@@ -718,6 +826,7 @@ export interface OrchestrationCycleResult {
   execution: ExecutionReport;
   cycleSummary: Record<string, unknown>;
   persistedPaths: PersistedPaths;
+  recipeMemory: RecipeMemory | null;
 }
 
 export interface RunCycleInput {
@@ -726,6 +835,13 @@ export interface RunCycleInput {
   mode: "dry-run" | "apply";
   runsDir: string;
   commandTimeoutMs?: number;
+  recipeOverride?: ExecutionRecipe;
+  enableRecipeMemory?: boolean;
+  requireWaveApproval?: boolean;
+  approvalsDir?: string;
+  requireEvidenceFile?: boolean;
+  evidenceFile?: string;
+  rollbackCheckCommand?: string;
 }
 
 export async function runOrchestrationCycle(input: RunCycleInput): Promise<OrchestrationCycleResult> {
@@ -734,7 +850,14 @@ export async function runOrchestrationCycle(input: RunCycleInput): Promise<Orche
   const existingState = loadRunState(paths.statePath);
   const state = existingState ?? createInitialRunState({ runId, goal: input.goal });
 
-  const recipe = getRecipeById(input.goal.recipeId);
+  const baseRecipe = input.recipeOverride ?? getRecipeById(input.goal.recipeId);
+  const recipeMemory = input.enableRecipeMemory === false
+    ? null
+    : deriveRecipeMemory({
+      runsDir: path.resolve(input.runsDir),
+      recipeId: baseRecipe.id,
+    });
+  const recipe = recipeMemory ? applyRecipeMemory({ recipe: baseRecipe, memory: recipeMemory }) : baseRecipe;
   if (recipe.goalType !== input.goal.goalType) {
     throw new Error(
       `Recipe '${recipe.id}' has goalType '${recipe.goalType}', incompatible with goal '${input.goal.goalType}'.`,
@@ -775,6 +898,11 @@ export async function runOrchestrationCycle(input: RunCycleInput): Promise<Orche
     mode: input.mode,
     state,
     timeoutMs: input.commandTimeoutMs ?? 15 * 60 * 1000,
+    requireWaveApproval: input.requireWaveApproval,
+    approvalsDir: input.approvalsDir,
+    requireEvidenceFile: input.requireEvidenceFile,
+    evidenceFile: input.evidenceFile,
+    rollbackCheckCommand: input.rollbackCheckCommand,
   });
 
   const nextState = updateState({
@@ -790,6 +918,7 @@ export async function runOrchestrationCycle(input: RunCycleInput): Promise<Orche
     validation,
     execution,
     state: nextState,
+    recipeMemory,
   });
 
   persistCycleArtifacts({
@@ -809,6 +938,7 @@ export async function runOrchestrationCycle(input: RunCycleInput): Promise<Orche
     execution,
     cycleSummary,
     persistedPaths: paths,
+    recipeMemory,
   };
 }
 

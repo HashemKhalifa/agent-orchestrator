@@ -119,4 +119,48 @@ describe("runOrchestrationCycle", () => {
     expect(result.execution.status).toBe("completed");
     expect(result.execution.done).toBe(true);
   });
+
+  it("blocks apply mode when evidence file is missing", async () => {
+    const repo = createTempRepo();
+    cleanupDirs.push(repo);
+
+    writeJson(path.join(repo, "package.json"), {
+      name: "apply-safety",
+      private: true,
+      scripts: {
+        "test:run": "node -e \"process.exit(0)\"",
+        typecheck: "node -e \"process.exit(0)\"",
+        lint: "node -e \"process.exit(0)\"",
+      },
+    });
+
+    mkdirSync(path.join(repo, ".github", "workflows"), { recursive: true });
+    writeFileSync(path.join(repo, ".github", "workflows", "ci.yml"), "name: ci\n", "utf8");
+    writeFileSync(path.join(repo, "vitest.config.ts"), "export default {};\n", "utf8");
+    mkdirSync(path.join(repo, "generated", "orchestration", "approvals"), { recursive: true });
+    writeFileSync(
+      path.join(repo, "generated", "orchestration", "approvals", "wave-1.approved.json"),
+      JSON.stringify({ approved: true }),
+      "utf8",
+    );
+
+    const result = await runOrchestrationCycle({
+      goal: {
+        goalType: "ci_refactor",
+        recipeId: "ci-node-build-test-modernization",
+        workspaceRoot: repo,
+        sourcePolicy: "primary_plus_curated_secondary",
+        riskGateMode: "warn_then_apply",
+        requireTddTests: true,
+        curatedSourceDomains: [],
+        additionalContext: {},
+        waveStrategy: "big_bang",
+      },
+      mode: "apply",
+      runsDir: path.join(repo, "generated", "runs"),
+    });
+
+    expect(result.execution.status).toBe("blocked");
+    expect(result.execution.blockerSummary.some((line) => line.includes("Apply evidence file missing"))).toBe(true);
+  });
 });

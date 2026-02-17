@@ -33,6 +33,8 @@ export function startRagServer(args: {
       return sendJson(res, 200, {
         fileCount: index.fileCount,
         chunkCount: index.chunkCount,
+        retrievalMode: index.retrievalMode,
+        embeddingDims: index.embeddingDims,
         generatedAt: index.generatedAt,
       });
     }
@@ -46,12 +48,16 @@ export function startRagServer(args: {
       const topKRaw = Number(url.searchParams.get("k") ?? 8);
       const topK = Number.isFinite(topKRaw) && topKRaw > 0 ? Math.floor(topKRaw) : 8;
       const filePathIncludes = url.searchParams.get("path") ?? undefined;
+      const bm25WeightRaw = Number(url.searchParams.get("bm25Weight") ?? 0.75);
+      const embeddingWeightRaw = Number(url.searchParams.get("embeddingWeight") ?? 0.25);
 
       const result = queryRagIndex({
         index,
         query,
         topK,
         filePathIncludes,
+        bm25Weight: Number.isFinite(bm25WeightRaw) ? bm25WeightRaw : 0.75,
+        embeddingWeight: Number.isFinite(embeddingWeightRaw) ? embeddingWeightRaw : 0.25,
       });
 
       return sendJson(res, 200, result);

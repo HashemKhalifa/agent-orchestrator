@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
@@ -9,9 +9,15 @@ import {
   type DagRunResult,
   type DagRunSummary,
 } from "./types.js";
-
-type ExecutorProfile = "none" | "codex-safe";
-type ApplyMode = "dry-run" | "apply";
+import {
+  applyExecutorTemplate,
+  buildProfileCommand,
+  buildProviderCommand,
+  isWaveApproved,
+  type ApplyMode,
+  type ExecutorProfile,
+  type ExecutorProvider,
+} from "./executors.js";
 
 function loadManifest(manifestPath: string): DagManifest {
   const raw = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -71,47 +77,13 @@ function topoLevelOrder(modules: DagManifest["modules"]): Array<{ level: number;
   return levels;
 }
 
-function applyExecutorTemplate(template: string, args: {
-  id: string;
-  title: string;
-  partFile: string;
-  requestPath: string;
-}): string {
-  return template
-    .replaceAll("{id}", args.id)
-    .replaceAll("{title}", args.title)
-    .replaceAll("{partFile}", args.partFile)
-    .replaceAll("{requestPath}", args.requestPath);
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
-}
-
-function buildCodexSafeCommand(args: {
-  moduleId: string;
-  title: string;
-  partFile: string;
-  requestPath: string;
-  applyMode: ApplyMode;
-}): string {
-  const modeLine = args.applyMode === "apply"
-    ? "APPLY MODE: implement the requested change safely, add tests, and validate gates."
-    : "DRY-RUN MODE: do not edit files; produce a concrete implementation plan and validation checklist.";
-
-  const prompt = [
-    `DAG module: ${args.moduleId}`,
-    `Title: ${args.title}`,
-    `Request path: ${args.requestPath}`,
-    `Part file: ${args.partFile}`,
-    modeLine,
-    "Always report exact commands run and outcomes.",
-  ].join("\n");
-
-  return `codex exec --full-auto ${shellQuote(prompt)}`;
-}
-
-function runCommand(command: string, cwd: string, timeoutMs: number): DagRunResult {
+function runCommandCheck(command: string, cwd: string, timeoutMs: number): {
+  passed: boolean;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+} {
   const startedAt = Date.now();
   const result = spawnSync(command, {
     cwd,
@@ -121,15 +93,85 @@ function runCommand(command: string, cwd: string, timeoutMs: number): DagRunResu
     maxBuffer: 8 * 1024 * 1024,
   });
 
+  const statusCode = typeof result.status === "number" ? result.status : null;
+  const stderr = result.stderr ?? (result.error ? result.error.message : "");
+
+  return {
+    passed: statusCode === 0,
+    code: statusCode,
+    stdout: result.stdout ?? "",
+    stderr,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  };
+}
+
+function runModuleCommand(command: string, cwd: string, timeoutMs: number): DagRunResult {
+  const check = runCommandCheck(command, cwd, timeoutMs);
   return DagRunResultSchema.parse({
     moduleId: "",
-    status: typeof result.status === "number" && result.status === 0 ? "success" : "failed",
+    status: check.passed ? "success" : "failed",
     command,
-    code: typeof result.status === "number" ? result.status : null,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? (result.error ? result.error.message : ""),
-    durationMs: Math.max(0, Date.now() - startedAt),
+    code: check.code,
+    stdout: check.stdout,
+    stderr: check.stderr,
+    durationMs: check.durationMs,
   });
+}
+
+function resolveModuleCommand(args: {
+  moduleCommand?: string;
+  executorTemplate?: string;
+  executorProfile: ExecutorProfile;
+  executorProvider?: ExecutorProvider;
+  providerTemplate?: string;
+  applyMode: ApplyMode;
+  moduleId: string;
+  title: string;
+  partFile: string;
+  requestPath: string;
+}): string | null {
+  if (args.moduleCommand) return args.moduleCommand;
+
+  if (args.executorTemplate) {
+    return applyExecutorTemplate(args.executorTemplate, {
+      id: args.moduleId,
+      title: args.title,
+      partFile: args.partFile,
+      requestPath: args.requestPath,
+    });
+  }
+
+  const profileCommand = buildProfileCommand({
+    profile: args.executorProfile,
+    applyMode: args.applyMode,
+    moduleId: args.moduleId,
+    title: args.title,
+    partFile: args.partFile,
+    requestPath: args.requestPath,
+  });
+  if (profileCommand) return profileCommand;
+
+  if (!args.executorProvider) return null;
+
+  return buildProviderCommand({
+    provider: args.executorProvider,
+    applyMode: args.applyMode,
+    moduleId: args.moduleId,
+    title: args.title,
+    partFile: args.partFile,
+    requestPath: args.requestPath,
+    providerTemplate: args.providerTemplate,
+  });
+}
+
+function resolveApprovalPath(args: {
+  workspaceRoot: string;
+  approvalDir?: string;
+  level: number;
+}): string {
+  const approvalDir = args.approvalDir ?? "generated/orchestration/approvals";
+  const approvalDirAbs = path.resolve(args.workspaceRoot, approvalDir);
+  return path.join(approvalDirAbs, `wave-${args.level + 1}.approved.json`);
 }
 
 export function runDag(args: {
@@ -137,6 +179,8 @@ export function runDag(args: {
   manifestPath: string;
   executorTemplate?: string;
   executorProfile?: ExecutorProfile;
+  executorProvider?: ExecutorProvider;
+  providerTemplate?: string;
   applyMode?: ApplyMode;
   applyGuardToken?: string;
   applyGuardValue?: string;
@@ -144,9 +188,15 @@ export function runDag(args: {
   timeoutMs?: number;
   outputPath?: string;
   dryRun?: boolean;
+  requireWaveApproval?: boolean;
+  approvalDir?: string;
+  requireEvidenceFile?: boolean;
+  evidenceFilePath?: string;
+  rollbackCheckCommand?: string;
 }): DagRunSummary {
   const runStartedAt = new Date().toISOString();
-  const manifestAbs = path.resolve(args.workspaceRoot, args.manifestPath);
+  const workspaceRoot = path.resolve(args.workspaceRoot);
+  const manifestAbs = path.resolve(workspaceRoot, args.manifestPath);
   const manifest = loadManifest(manifestAbs);
   const timeoutMs = Math.max(1000, args.timeoutMs ?? 10 * 60 * 1000);
   const failPolicy = args.failPolicy ?? "graph";
@@ -161,6 +211,22 @@ export function runDag(args: {
         `Apply mode blocked: invalid apply guard token. Provide --apply-guard-token ${required}`,
       );
     }
+
+    const requireEvidenceFile = args.requireEvidenceFile ?? true;
+    if (requireEvidenceFile) {
+      const evidenceFile = path.resolve(workspaceRoot, args.evidenceFilePath ?? "generated/orchestration/evidence/apply-evidence.md");
+      if (!existsSync(evidenceFile)) {
+        throw new Error(`Apply mode blocked: missing evidence file ${path.relative(workspaceRoot, evidenceFile)}.`);
+      }
+    }
+
+    if (args.rollbackCheckCommand) {
+      const rollbackCheck = runCommandCheck(args.rollbackCheckCommand, workspaceRoot, timeoutMs);
+      if (!rollbackCheck.passed) {
+        const details = rollbackCheck.stderr.trim() || rollbackCheck.stdout.trim() || "rollback check failed";
+        throw new Error(`Apply mode blocked: rollback check command failed (${details.slice(0, 240)}).`);
+      }
+    }
   }
 
   const moduleById = new Map(manifest.modules.map((module) => [module.id, module]));
@@ -170,6 +236,40 @@ export function runDag(args: {
   const levels = topoLevelOrder(manifest.modules);
 
   for (const level of levels) {
+    if (applyMode === "apply" && (args.requireWaveApproval ?? true)) {
+      const approvalPath = resolveApprovalPath({
+        workspaceRoot,
+        approvalDir: args.approvalDir,
+        level: level.level,
+      });
+
+      if (!isWaveApproved(approvalPath)) {
+        for (const moduleId of level.moduleIds) {
+          const module = moduleById.get(moduleId);
+          if (!module) continue;
+
+          results.push(
+            DagRunResultSchema.parse({
+              moduleId: module.id,
+              status: "blocked",
+              command: null,
+              code: null,
+              stdout: "",
+              stderr: `wave approval missing: ${path.relative(workspaceRoot, approvalPath).replace(/\\/g, "/")}`,
+              durationMs: 0,
+            }),
+          );
+          failedModules.add(module.id);
+        }
+
+        if (failPolicy === "global") {
+          break;
+        }
+
+        continue;
+      }
+    }
+
     for (const moduleId of level.moduleIds) {
       const module = moduleById.get(moduleId);
       if (!module) continue;
@@ -191,25 +291,19 @@ export function runDag(args: {
         continue;
       }
 
-      const modulePartAbs = path.resolve(args.workspaceRoot, module.partPath);
-      const command = module.command
-        ? module.command
-        : args.executorTemplate
-        ? applyExecutorTemplate(args.executorTemplate, {
-            id: module.id,
-            title: module.title,
-            partFile: modulePartAbs,
-            requestPath: manifest.requestPath,
-          })
-        : executorProfile === "codex-safe"
-        ? buildCodexSafeCommand({
-            moduleId: module.id,
-            title: module.title,
-            partFile: modulePartAbs,
-            requestPath: manifest.requestPath,
-            applyMode,
-          })
-        : null;
+      const modulePartAbs = path.resolve(workspaceRoot, module.partPath);
+      const command = resolveModuleCommand({
+        moduleCommand: module.command,
+        executorTemplate: args.executorTemplate,
+        executorProfile,
+        executorProvider: args.executorProvider,
+        providerTemplate: args.providerTemplate,
+        applyMode,
+        moduleId: module.id,
+        title: module.title,
+        partFile: modulePartAbs,
+        requestPath: manifest.requestPath,
+      });
 
       if (!command) {
         results.push(
@@ -219,7 +313,7 @@ export function runDag(args: {
             command: null,
             code: null,
             stdout: "",
-            stderr: "no module command or executor template provided",
+            stderr: "no module command, executor template, profile, or provider configured",
             durationMs: 0,
           }),
         );
@@ -241,7 +335,7 @@ export function runDag(args: {
         continue;
       }
 
-      const commandResult = runCommand(command, args.workspaceRoot, timeoutMs);
+      const commandResult = runModuleCommand(command, workspaceRoot, timeoutMs);
       const normalized = DagRunResultSchema.parse({
         ...commandResult,
         moduleId: module.id,
@@ -276,7 +370,7 @@ export function runDag(args: {
     : "failure";
 
   const summary = DagRunSummarySchema.parse({
-    manifestPath: path.relative(args.workspaceRoot, manifestAbs).replace(/\\/g, "/"),
+    manifestPath: path.relative(workspaceRoot, manifestAbs).replace(/\\/g, "/"),
     startedAt: runStartedAt,
     completedAt: new Date().toISOString(),
     status,
@@ -284,7 +378,7 @@ export function runDag(args: {
   });
 
   if (args.outputPath) {
-    const outAbs = path.resolve(args.workspaceRoot, args.outputPath);
+    const outAbs = path.resolve(workspaceRoot, args.outputPath);
     mkdirSync(path.dirname(outAbs), { recursive: true });
     writeFileSync(outAbs, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
   }

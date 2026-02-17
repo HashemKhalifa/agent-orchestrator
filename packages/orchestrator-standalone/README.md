@@ -51,6 +51,15 @@ npm --prefix packages/orchestrator-standalone run cli -- auto-run \
   --recipe-id webpack-to-rsbuild-incremental \
   --executor-profile codex-safe \
   --apply-mode dry-run
+
+# Auto-generate a recipe from discovery + historical run memory
+npm --prefix packages/orchestrator-standalone run cli -- recipe-generate \
+  --goal-type dependency_upgrade \
+  --recipe-id autogen-react-upgrade \
+  --recipe-output generated/orchestration/recipes/autogen-react-upgrade.json
+
+# Golden deterministic evaluation suite
+npm --prefix packages/orchestrator-standalone run cli -- eval-golden
 ```
 
 ## Built-in Recipes (v1)
@@ -89,3 +98,6 @@ Artifacts per cycle:
 - This package is opt-in via CLI invocation.
 - Root-level `unpack.config.ts` enables custom split rules for large request files.
 - `dag-run --apply-mode apply` is guard-protected; pass `--apply-guard-token ALLOW_APPLY` (or custom guard value) explicitly.
+- Apply mode supports stronger controls: wave approvals (`--approvals-dir`), evidence file requirement (`--evidence-file`), and rollback readiness command (`--rollback-check-command`).
+- Executor abstraction supports Codex and Claude profiles (`--executor-profile codex-safe|claude-safe`) plus custom provider templates.
+- RAG retrieval uses hybrid BM25 + embedding scoring with tunable weights.

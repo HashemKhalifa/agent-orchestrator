@@ -1,0 +1,9 @@
+{
+  "name": "golden-jest-vitest",
+  "private": true,
+  "scripts": {
+    "test": "jest",
+    "typecheck": "tsc --noEmit",
+    "test:run": "vitest run"
+  }
+}

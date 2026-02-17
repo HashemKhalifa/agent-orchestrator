@@ -16,6 +16,8 @@
     "dag:run": "tsx src/cli.ts dag-run",
     "rag:index": "tsx src/cli.ts rag-index",
     "rag:query": "tsx src/cli.ts rag-query",
+    "eval:golden": "tsx src/cli.ts eval-golden",
+    "recipe:generate": "tsx src/cli.ts recipe-generate",
     "autonomy:auto-run": "tsx src/cli.ts auto-run",
     "autonomy:synthesize": "tsx src/cli.ts synthesize-tasks",
     "skills:autogen": "tsx src/cli.ts skills-autogen",

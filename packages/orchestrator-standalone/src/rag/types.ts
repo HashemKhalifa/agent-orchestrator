@@ -7,7 +7,9 @@ export const RagChunkSchema = z.object({
   endLine: z.number().int().positive(),
   text: z.string(),
   tokenCount: z.number().int().nonnegative(),
-  termFreq: z.record(z.string(), z.number().nonnegative()),
+  termFreq: z.record(z.string(), z.number().nonnegative()).default({}),
+  termCounts: z.record(z.string(), z.number().int().positive()).default({}),
+  embedding: z.array(z.number()).default([]),
 });
 
 export const RagIndexSchema = z.object({
@@ -17,6 +19,9 @@ export const RagIndexSchema = z.object({
   fileCount: z.number().int().nonnegative(),
   chunkCount: z.number().int().nonnegative(),
   vocabularyDf: z.record(z.string(), z.number().int().positive()),
+  avgDocLength: z.number().positive().default(1),
+  embeddingDims: z.number().int().positive().default(96),
+  retrievalMode: z.enum(["tfidf", "hybrid_bm25_embedding"]).default("hybrid_bm25_embedding"),
   chunks: z.array(RagChunkSchema),
 });
 
@@ -26,6 +31,8 @@ export const RagQueryHitSchema = z.object({
   startLine: z.number().int().positive(),
   endLine: z.number().int().positive(),
   score: z.number(),
+  bm25Score: z.number(),
+  embeddingScore: z.number(),
   matchedTerms: z.array(z.string()),
   excerpt: z.string(),
 });

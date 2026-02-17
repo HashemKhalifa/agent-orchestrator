@@ -22,7 +22,10 @@ npm --prefix packages/orchestrator-standalone run cli -- dag-compile --request <
 3. Run DAG:
 
 ```bash
-npm --prefix packages/orchestrator-standalone run cli -- dag-run --manifest generated/orchestration/dag/manifest.json --executor "codex exec --full-auto \"Process {partFile}\""
+npm --prefix packages/orchestrator-standalone run cli -- dag-run \
+  --manifest generated/orchestration/dag/manifest.json \
+  --executor-profile codex-safe \
+  --apply-mode dry-run
 ```
 
 ## Notes
@@ -30,4 +33,5 @@ npm --prefix packages/orchestrator-standalone run cli -- dag-run --manifest gene
 - `unpack.config.ts` is auto-used when present.
 - Fallback splitter uses markdown headings.
 - Dependency modes: `staged`, `sequential`, `parallel`.
-- Runner is non-destructive by default unless executor command performs mutations.
+- Execution providers: `codex-safe`, `claude-safe`, or `--executor-provider custom`.
+- Apply mode requires guard token, wave approvals, evidence file, and optional rollback-check command.

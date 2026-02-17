@@ -58,3 +58,28 @@ bash scripts/run-bot-request-until-done.sh \
   --executor-profile codex-safe \
   --apply-mode dry-run
 ```
+
+Claude-backed execution (provider abstraction):
+
+```bash
+bash scripts/run-bot-request-until-done.sh \
+  --goal-type dependency_upgrade \
+  --recipe-id react18-to-react19 \
+  --executor-profile claude-safe \
+  --apply-mode dry-run
+```
+
+Automate recipe authoring from discovery + run memory:
+
+```bash
+npm --prefix packages/orchestrator-standalone run cli -- recipe-generate \
+  --goal-type test_runner_migration \
+  --recipe-id autogen-jest-vitest \
+  --recipe-output generated/orchestration/recipes/autogen-jest-vitest.json
+```
+
+Deterministic golden suite:
+
+```bash
+npm --prefix packages/orchestrator-standalone run cli -- eval-golden
+```

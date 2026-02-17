@@ -10,5 +10,7 @@ This repo includes:
   - `.codex/skills/react19-upgrade`
   - `.codex/skills/jest-to-vitest`
   - `.codex/skills/ci-modernization`
+  - `.codex/skills/claude-orchestration`
+  - `.codex/skills/recipe-autogen`
 
 System skills were imported from `monolith-rs` commit `017b708ed35bb5a3c5d6aecbc186cad31beaa99f`.

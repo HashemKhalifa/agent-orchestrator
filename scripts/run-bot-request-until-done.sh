@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 GOAL_TYPE=""
 RECIPE_ID=""
+RECIPE_FILE=""
 WORKSPACE_ROOT="."
 AUTONOMY_DIR="generated/orchestration/autonomy"
 MAX_ITERATIONS=20
@@ -17,12 +18,21 @@ DEPENDENCY_MODE="staged"
 MAX_TASKS=24
 MAX_FILES=3000
 EXECUTOR_PROFILE="codex-safe"
+EXECUTOR_PROVIDER=""
+PROVIDER_TEMPLATE=""
 EXECUTOR_TEMPLATE=""
 APPLY_MODE="dry-run"
 APPLY_GUARD_TOKEN=""
 APPLY_GUARD_VALUE=""
+APPROVALS_DIR=""
+REQUIRE_WAVE_APPROVAL=true
+EVIDENCE_FILE=""
+REQUIRE_EVIDENCE_FILE=true
+ROLLBACK_CHECK_COMMAND=""
 FAIL_POLICY="graph"
 AUTO_SKILLS="suggest"
+AUTO_RECIPE=false
+AUTO_RECIPE_ID=""
 SKILLS_DIR=".codex/skills/generated"
 MIN_OCCURRENCES=2
 JSON_OUT=""
@@ -34,10 +44,11 @@ run-bot-request-until-done.sh
 
 Usage:
   ./scripts/run-bot-request-until-done.sh --goal-type <type> --recipe-id <id> [options]
+  ./scripts/run-bot-request-until-done.sh --goal-type <type> --recipe-file <path> [options]
 
 Required:
   --goal-type <build_migration|dependency_upgrade|ci_refactor|test_runner_migration|custom>
-  --recipe-id <recipe-id>
+  --recipe-id <recipe-id> | --recipe-file <path>
 
 Core options:
   --workspace-root <path>         Target repo root (default: .)
@@ -55,15 +66,24 @@ Planning/discovery options:
   --max-tasks <n>                 Max synthesized tasks (default: 24)
 
 Execution options:
-  --executor-profile <profile>    none|codex-safe (default: codex-safe)
+  --executor-profile <profile>    none|codex-safe|claude-safe (default: codex-safe)
+  --executor-provider <provider>  codex|claude|custom (optional)
+  --provider-template <cmd>       Template for custom provider ({prompt}, {moduleId}, {title}, {partFile})
   --executor <template>           Optional command template override for DAG modules
   --apply-mode <mode>             dry-run|apply (default: dry-run)
   --apply-guard-token <token>     Required in apply mode unless default guard is used
   --apply-guard-value <token>     Expected guard value (default: ALLOW_APPLY)
+  --approvals-dir <path>          Apply approvals directory
+  --no-require-wave-approval      Disable apply wave approval requirement
+  --evidence-file <path>          Apply evidence file path
+  --no-require-evidence-file      Disable apply evidence requirement
+  --rollback-check-command <cmd>  Command that must pass before apply mode
   --fail-policy <policy>          graph|global (default: graph)
 
 Skill options:
   --auto-skills <mode>            off|suggest|apply (default: suggest)
+  --auto-recipe                   Generate recipe from discovery + memory each iteration
+  --auto-recipe-id <id>           Override generated recipe id
   --skills-dir <path>             Skill output dir (default: .codex/skills/generated)
   --min-occurrences <n>           Pattern threshold for skill generation (default: 2)
 
@@ -81,6 +101,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --recipe-id)
       RECIPE_ID="${2:-}"
+      shift 2
+      ;;
+    --recipe-file)
+      RECIPE_FILE="${2:-}"
       shift 2
       ;;
     --workspace-root)
@@ -131,6 +155,14 @@ while [[ $# -gt 0 ]]; do
       EXECUTOR_PROFILE="${2:-}"
       shift 2
       ;;
+    --executor-provider)
+      EXECUTOR_PROVIDER="${2:-}"
+      shift 2
+      ;;
+    --provider-template)
+      PROVIDER_TEMPLATE="${2:-}"
+      shift 2
+      ;;
     --executor)
       EXECUTOR_TEMPLATE="${2:-}"
       shift 2
@@ -147,12 +179,40 @@ while [[ $# -gt 0 ]]; do
       APPLY_GUARD_VALUE="${2:-}"
       shift 2
       ;;
+    --approvals-dir)
+      APPROVALS_DIR="${2:-}"
+      shift 2
+      ;;
+    --no-require-wave-approval)
+      REQUIRE_WAVE_APPROVAL=false
+      shift
+      ;;
+    --evidence-file)
+      EVIDENCE_FILE="${2:-}"
+      shift 2
+      ;;
+    --no-require-evidence-file)
+      REQUIRE_EVIDENCE_FILE=false
+      shift
+      ;;
+    --rollback-check-command)
+      ROLLBACK_CHECK_COMMAND="${2:-}"
+      shift 2
+      ;;
     --fail-policy)
       FAIL_POLICY="${2:-}"
       shift 2
       ;;
     --auto-skills)
       AUTO_SKILLS="${2:-}"
+      shift 2
+      ;;
+    --auto-recipe)
+      AUTO_RECIPE=true
+      shift
+      ;;
+    --auto-recipe-id)
+      AUTO_RECIPE_ID="${2:-}"
       shift 2
       ;;
     --skills-dir)
@@ -179,8 +239,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$GOAL_TYPE" || -z "$RECIPE_ID" ]]; then
-  echo "ERROR: --goal-type and --recipe-id are required" >&2
+if [[ -z "$GOAL_TYPE" ]]; then
+  echo "ERROR: --goal-type is required" >&2
+  exit 1
+fi
+
+if [[ -z "$RECIPE_ID" && -z "$RECIPE_FILE" ]]; then
+  echo "ERROR: either --recipe-id or --recipe-file is required" >&2
   exit 1
 fi
 
@@ -199,8 +264,13 @@ if [[ "$APPLY_MODE" != "dry-run" && "$APPLY_MODE" != "apply" ]]; then
   exit 1
 fi
 
-if [[ "$EXECUTOR_PROFILE" != "none" && "$EXECUTOR_PROFILE" != "codex-safe" ]]; then
-  echo "ERROR: --executor-profile must be none or codex-safe" >&2
+if [[ "$EXECUTOR_PROFILE" != "none" && "$EXECUTOR_PROFILE" != "codex-safe" && "$EXECUTOR_PROFILE" != "claude-safe" ]]; then
+  echo "ERROR: --executor-profile must be none, codex-safe, or claude-safe" >&2
+  exit 1
+fi
+
+if [[ -n "$EXECUTOR_PROVIDER" && "$EXECUTOR_PROVIDER" != "codex" && "$EXECUTOR_PROVIDER" != "claude" && "$EXECUTOR_PROVIDER" != "custom" ]]; then
+  echo "ERROR: --executor-provider must be codex, claude, or custom" >&2
   exit 1
 fi
 
@@ -235,7 +305,6 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
   CMD=(
     npm --prefix packages/orchestrator-standalone run cli -- auto-run
     --goal-type "$GOAL_TYPE"
-    --recipe-id "$RECIPE_ID"
     --workspace-root "$WORKSPACE_ROOT"
     --autonomy-dir "$AUTONOMY_DIR"
     --source-policy "$SOURCE_POLICY"
@@ -252,8 +321,24 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
     --json-out "$ITER_SUMMARY"
   )
 
+  if [[ -n "$RECIPE_ID" ]]; then
+    CMD+=(--recipe-id "$RECIPE_ID")
+  fi
+
+  if [[ -n "$RECIPE_FILE" ]]; then
+    CMD+=(--recipe-file "$RECIPE_FILE")
+  fi
+
   if [[ -n "$EXECUTOR_TEMPLATE" ]]; then
     CMD+=(--executor "$EXECUTOR_TEMPLATE")
+  fi
+
+  if [[ -n "$EXECUTOR_PROVIDER" ]]; then
+    CMD+=(--executor-provider "$EXECUTOR_PROVIDER")
+  fi
+
+  if [[ -n "$PROVIDER_TEMPLATE" ]]; then
+    CMD+=(--provider-template "$PROVIDER_TEMPLATE")
   fi
 
   if [[ -n "$WAVE_STRATEGY" ]]; then
@@ -268,11 +353,40 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
     CMD+=(--apply-guard-value "$APPLY_GUARD_VALUE")
   fi
 
+  if [[ -n "$APPROVALS_DIR" ]]; then
+    CMD+=(--approvals-dir "$APPROVALS_DIR")
+  fi
+
+  if [[ "$REQUIRE_WAVE_APPROVAL" == "false" ]]; then
+    CMD+=(--no-require-wave-approval)
+  fi
+
+  if [[ -n "$EVIDENCE_FILE" ]]; then
+    CMD+=(--evidence-file "$EVIDENCE_FILE")
+  fi
+
+  if [[ "$REQUIRE_EVIDENCE_FILE" == "false" ]]; then
+    CMD+=(--no-require-evidence-file)
+  fi
+
+  if [[ -n "$ROLLBACK_CHECK_COMMAND" ]]; then
+    CMD+=(--rollback-check-command "$ROLLBACK_CHECK_COMMAND")
+  fi
+
+  if [[ "$AUTO_RECIPE" == "true" ]]; then
+    CMD+=(--auto-recipe)
+  fi
+
+  if [[ -n "$AUTO_RECIPE_ID" ]]; then
+    CMD+=(--auto-recipe-id "$AUTO_RECIPE_ID")
+  fi
+
   for domain in "${CURATED_DOMAINS[@]}"; do
     CMD+=(--curated-domain "$domain")
   done
 
-  echo "==> [iteration $iteration/$MAX_ITERATIONS] auto-run for recipe '$RECIPE_ID'"
+  RECIPE_LABEL="${RECIPE_ID:-$RECIPE_FILE}"
+  echo "==> [iteration $iteration/$MAX_ITERATIONS] auto-run for recipe '$RECIPE_LABEL'"
   "${CMD[@]}"
 
   STATUS_LINE="$(

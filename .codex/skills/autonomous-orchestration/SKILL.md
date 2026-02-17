@@ -16,6 +16,7 @@ bash scripts/run-bot-request-until-done.sh \
   --goal-type <goal-type> \
   --recipe-id <recipe-id> \
   --executor-profile codex-safe \
+  --auto-recipe \
   --apply-mode dry-run
 ```
 
@@ -32,13 +33,16 @@ bash scripts/run-bot-request-until-done.sh \
 bash scripts/run-bot-request-until-done.sh \
   --goal-type <goal-type> \
   --recipe-id <recipe-id> \
-  --executor-profile codex-safe \
+  --executor-profile claude-safe \
   --apply-mode apply \
-  --apply-guard-token ALLOW_APPLY
+  --apply-guard-token ALLOW_APPLY \
+  --evidence-file generated/orchestration/evidence/apply-evidence.md \
+  --rollback-check-command "npm run test:run"
 ```
 
 ## Safety
 
 - Keep `strict_blockers` risk mode unless explicitly overridden.
 - Use `--auto-skills suggest` first, then `apply` after review.
+- Keep wave approvals in `generated/orchestration/approvals/wave-<n>.approved.json`.
 - Persist summaries and failed module IDs for deterministic retries.
