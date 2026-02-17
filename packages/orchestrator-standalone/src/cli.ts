@@ -12,6 +12,9 @@ import { getRecipeById, getRecipeCatalog } from "./recipes/catalog.js";
 import { discoverWorkspaceFacts, summarizeWorkspaceFacts } from "./adapters/workspace-discovery.js";
 import { collectInternetEvidence } from "./adapters/internet-evidence.js";
 import { getRunStatus, runOrchestrationCycle, validatePlan } from "./kernel/orchestrator.js";
+import { DagDependencyModeSchema } from "./dag/types.js";
+import { compileRequestDag } from "./dag/compiler.js";
+import { runDag } from "./dag/runner.js";
 
 interface ParsedArgs {
   command: string;
@@ -55,13 +58,17 @@ function optionList(args: ParsedArgs, key: string): string[] {
   return args.options.get(key) ?? [];
 }
 
-function writeJson(outPath: string | undefined, payload: unknown): void {
+function defaultWorkspaceRoot(): string {
+  return process.env.INIT_CWD ? path.resolve(process.env.INIT_CWD) : ".";
+}
+
+function writeJson(outPath: string | undefined, payload: unknown, baseDir = process.cwd()): void {
   if (!outPath) {
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     return;
   }
 
-  const absolute = path.resolve(outPath);
+  const absolute = path.isAbsolute(outPath) ? outPath : path.resolve(baseDir, outPath);
   mkdirSync(path.dirname(absolute), { recursive: true });
   writeFileSync(absolute, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   process.stdout.write(`${JSON.stringify({ ok: true, path: absolute }, null, 2)}\n`);
@@ -77,6 +84,8 @@ function printHelp(): void {
   process.stdout.write(`  execute --goal-type <type> --recipe-id <id> [options]\n`);
   process.stdout.write(`  cycle --goal-type <type> --recipe-id <id> [options]\n`);
   process.stdout.write(`  status --run-id <id> [options]\n\n`);
+  process.stdout.write(`  dag-compile --request <path> [options]    Compile request markdown into DAG manifest + parts\n`);
+  process.stdout.write(`  dag-run --manifest <path> [options]       Run dependency-aware DAG modules\n\n`);
   process.stdout.write(`Common options:\n`);
   process.stdout.write(`  --workspace-root <path>      (default: .)\n`);
   process.stdout.write(`  --runs-dir <path>            (default: generated/orchestration/standalone/runs)\n`);
@@ -87,6 +96,12 @@ function printHelp(): void {
   process.stdout.write(`  --wave-strategy incremental_dual_build|pilot_wave|big_bang|custom\n`);
   process.stdout.write(`  --curated-domain <domain>    (repeatable)\n`);
   process.stdout.write(`  --no-require-tdd-tests\n`);
+  process.stdout.write(`  --dependency <sequential|parallel|staged> (dag-compile)\n`);
+  process.stdout.write(`  --output-dir <path>          (dag-compile; default generated/orchestration/dag)\n`);
+  process.stdout.write(`  --executor <cmd-template>    (dag-run; placeholders {id} {title} {partFile} {requestPath})\n`);
+  process.stdout.write(`  --fail-policy <graph|global> (dag-run; default graph)\n`);
+  process.stdout.write(`  --timeout-ms <n>             (dag-run command timeout)\n`);
+  process.stdout.write(`  --dry-run                    (dag-run without executing commands)\n`);
   process.stdout.write(`  --json-out <path>            Write JSON to file\n`);
 }
 
@@ -109,7 +124,7 @@ function parseGoal(args: ParsedArgs): ReturnType<typeof OrchestrationGoalSchema.
   return OrchestrationGoalSchema.parse({
     goalType,
     recipeId,
-    workspaceRoot: option(args, "workspace-root", "."),
+    workspaceRoot: option(args, "workspace-root", defaultWorkspaceRoot()),
     sourceSystem: option(args, "source-system"),
     targetSystem: option(args, "target-system"),
     sourcePolicy,
@@ -240,6 +255,61 @@ async function commandStatus(args: ParsedArgs): Promise<void> {
   writeJson(option(args, "json-out"), state);
 }
 
+async function commandDagCompile(args: ParsedArgs): Promise<void> {
+  const requestPath = option(args, "request");
+  if (!requestPath) throw new Error("--request <path> is required");
+
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const outputDir = option(args, "output-dir", "generated/orchestration/dag") as string;
+  const dependencyMode = DagDependencyModeSchema.parse(option(args, "dependency", "staged"));
+
+  const manifest = await compileRequestDag({
+    workspaceRoot,
+    requestPath,
+    outputDir,
+    dependencyMode,
+    name: option(args, "name"),
+    description: option(args, "description"),
+  });
+
+  writeJson(option(args, "json-out"), manifest, workspaceRoot);
+}
+
+async function commandDagRun(args: ParsedArgs): Promise<void> {
+  const manifestPath = option(args, "manifest");
+  if (!manifestPath) throw new Error("--manifest <path> is required");
+
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const failPolicyRaw = option(args, "fail-policy", "graph");
+  if (failPolicyRaw !== "graph" && failPolicyRaw !== "global") {
+    throw new Error("--fail-policy must be graph or global");
+  }
+
+  const timeoutRaw = option(args, "timeout-ms");
+  const timeoutMs = timeoutRaw ? Number(timeoutRaw) : undefined;
+  if (timeoutRaw && (!Number.isFinite(timeoutMs) || (timeoutMs as number) < 1)) {
+    throw new Error("--timeout-ms must be a positive number");
+  }
+
+  const summary = runDag({
+    workspaceRoot,
+    manifestPath,
+    executorTemplate: option(args, "executor"),
+    failPolicy: failPolicyRaw,
+    timeoutMs: timeoutMs as number | undefined,
+    outputPath: option(args, "json-out"),
+    dryRun: option(args, "dry-run") === "true",
+  });
+
+  if (!option(args, "json-out")) {
+    writeJson(undefined, summary);
+  } else {
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, status: summary.status, outputPath: option(args, "json-out") }, null, 2)}\n`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
 
@@ -269,6 +339,12 @@ async function main(): Promise<void> {
       return;
     case "status":
       await commandStatus(parsed);
+      return;
+    case "dag-compile":
+      await commandDagCompile(parsed);
+      return;
+    case "dag-run":
+      await commandDagRun(parsed);
       return;
     default:
       throw new Error(`Unknown command '${parsed.command}'. Use 'help'.`);

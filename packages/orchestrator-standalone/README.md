@@ -26,6 +26,14 @@ npm --prefix packages/orchestrator-standalone run cli -- cycle \
 
 # Check run state
 npm --prefix packages/orchestrator-standalone run cli -- status --run-id <run-id>
+
+# Compile large request docs into DAG modules (uses unpack.config.ts when present)
+npm --prefix packages/orchestrator-standalone run cli -- dag-compile --request request.md
+
+# Run DAG modules with an executor template
+npm --prefix packages/orchestrator-standalone run cli -- dag-run \
+  --manifest generated/orchestration/dag/manifest.json \
+  --executor "codex exec --full-auto \"Process {partFile}\""
 ```
 
 ## Built-in Recipes (v1)
@@ -62,3 +70,4 @@ Artifacts per cycle:
 
 - Existing MCP and legacy orchestration flows are unchanged by default.
 - This package is opt-in via CLI invocation.
+- Root-level `unpack.config.ts` enables custom split rules for large request files.

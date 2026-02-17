@@ -12,6 +12,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "cli": "tsx src/cli.ts",
+    "dag:compile": "tsx src/cli.ts dag-compile",
+    "dag:run": "tsx src/cli.ts dag-run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:run": "vitest run src/**/*.test.ts"
   },
