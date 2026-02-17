@@ -10,6 +10,9 @@ import {
   type DagRunSummary,
 } from "./types.js";
 
+type ExecutorProfile = "none" | "codex-safe";
+type ApplyMode = "dry-run" | "apply";
+
 function loadManifest(manifestPath: string): DagManifest {
   const raw = JSON.parse(readFileSync(manifestPath, "utf8"));
   return DagManifestSchema.parse(raw);
@@ -81,6 +84,33 @@ function applyExecutorTemplate(template: string, args: {
     .replaceAll("{requestPath}", args.requestPath);
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function buildCodexSafeCommand(args: {
+  moduleId: string;
+  title: string;
+  partFile: string;
+  requestPath: string;
+  applyMode: ApplyMode;
+}): string {
+  const modeLine = args.applyMode === "apply"
+    ? "APPLY MODE: implement the requested change safely, add tests, and validate gates."
+    : "DRY-RUN MODE: do not edit files; produce a concrete implementation plan and validation checklist.";
+
+  const prompt = [
+    `DAG module: ${args.moduleId}`,
+    `Title: ${args.title}`,
+    `Request path: ${args.requestPath}`,
+    `Part file: ${args.partFile}`,
+    modeLine,
+    "Always report exact commands run and outcomes.",
+  ].join("\n");
+
+  return `codex exec --full-auto ${shellQuote(prompt)}`;
+}
+
 function runCommand(command: string, cwd: string, timeoutMs: number): DagRunResult {
   const startedAt = Date.now();
   const result = spawnSync(command, {
@@ -106,6 +136,10 @@ export function runDag(args: {
   workspaceRoot: string;
   manifestPath: string;
   executorTemplate?: string;
+  executorProfile?: ExecutorProfile;
+  applyMode?: ApplyMode;
+  applyGuardToken?: string;
+  applyGuardValue?: string;
   failPolicy?: "graph" | "global";
   timeoutMs?: number;
   outputPath?: string;
@@ -117,6 +151,17 @@ export function runDag(args: {
   const timeoutMs = Math.max(1000, args.timeoutMs ?? 10 * 60 * 1000);
   const failPolicy = args.failPolicy ?? "graph";
   const dryRun = Boolean(args.dryRun);
+  const executorProfile = args.executorProfile ?? "none";
+  const applyMode = args.applyMode ?? "dry-run";
+
+  if (applyMode === "apply") {
+    const required = args.applyGuardValue ?? "ALLOW_APPLY";
+    if (args.applyGuardToken !== required) {
+      throw new Error(
+        `Apply mode blocked: invalid apply guard token. Provide --apply-guard-token ${required}`,
+      );
+    }
+  }
 
   const moduleById = new Map(manifest.modules.map((module) => [module.id, module]));
   const failedModules = new Set<string>();
@@ -155,6 +200,14 @@ export function runDag(args: {
             title: module.title,
             partFile: modulePartAbs,
             requestPath: manifest.requestPath,
+          })
+        : executorProfile === "codex-safe"
+        ? buildCodexSafeCommand({
+            moduleId: module.id,
+            title: module.title,
+            partFile: modulePartAbs,
+            requestPath: manifest.requestPath,
+            applyMode,
           })
         : null;
 

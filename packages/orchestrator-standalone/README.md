@@ -34,6 +34,23 @@ npm --prefix packages/orchestrator-standalone run cli -- dag-compile --request r
 npm --prefix packages/orchestrator-standalone run cli -- dag-run \
   --manifest generated/orchestration/dag/manifest.json \
   --executor "codex exec --full-auto \"Process {partFile}\""
+
+# Build/query local RAG index
+npm --prefix packages/orchestrator-standalone run cli -- rag-index
+npm --prefix packages/orchestrator-standalone run cli -- rag-query --query "webpack rsbuild compatibility"
+
+# Synthesize request.md from discovery + RAG and compile DAG
+npm --prefix packages/orchestrator-standalone run cli -- synthesize-tasks \
+  --goal-type build_migration \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --compile-dag
+
+# End-to-end autonomous pass (discover -> RAG -> synthesize -> DAG run -> skills)
+npm --prefix packages/orchestrator-standalone run cli -- auto-run \
+  --goal-type build_migration \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --executor-profile codex-safe \
+  --apply-mode dry-run
 ```
 
 ## Built-in Recipes (v1)
@@ -71,3 +88,4 @@ Artifacts per cycle:
 - Existing MCP and legacy orchestration flows are unchanged by default.
 - This package is opt-in via CLI invocation.
 - Root-level `unpack.config.ts` enables custom split rules for large request files.
+- `dag-run --apply-mode apply` is guard-protected; pass `--apply-guard-token ALLOW_APPLY` (or custom guard value) explicitly.

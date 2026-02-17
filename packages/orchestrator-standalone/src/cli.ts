@@ -15,6 +15,11 @@ import { getRunStatus, runOrchestrationCycle, validatePlan } from "./kernel/orch
 import { DagDependencyModeSchema } from "./dag/types.js";
 import { compileRequestDag } from "./dag/compiler.js";
 import { runDag } from "./dag/runner.js";
+import { buildRagIndex, saveRagIndex } from "./rag/indexer.js";
+import { loadRagIndex, queryRagIndex } from "./rag/retriever.js";
+import { startRagServer } from "./rag/server.js";
+import { synthesizeTaskRequest } from "./autonomy/task-synthesizer.js";
+import { autoGenerateSkills } from "./skills/autogen.js";
 
 interface ParsedArgs {
   command: string;
@@ -39,8 +44,10 @@ function parseArgs(argv: string[]): ParsedArgs {
     const next = argv[index + 1];
     const hasValue = next !== undefined && !next.startsWith("--");
     const value = hasValue ? next : "true";
+
     if (!options.has(key)) options.set(key, []);
     (options.get(key) as string[]).push(value);
+
     index += hasValue ? 2 : 1;
   }
 
@@ -56,6 +63,18 @@ function option(args: ParsedArgs, key: string, fallback?: string): string | unde
 
 function optionList(args: ParsedArgs, key: string): string[] {
   return args.options.get(key) ?? [];
+}
+
+function flag(args: ParsedArgs, key: string): boolean {
+  return option(args, key) === "true";
+}
+
+function parseNumber(args: ParsedArgs, key: string, fallback: number): number {
+  const raw = option(args, key);
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`--${key} must be a number`);
+  return n;
 }
 
 function defaultWorkspaceRoot(): string {
@@ -83,26 +102,64 @@ function printHelp(): void {
   process.stdout.write(`  validate --plan <path>               Validate a plan artifact\n`);
   process.stdout.write(`  execute --goal-type <type> --recipe-id <id> [options]\n`);
   process.stdout.write(`  cycle --goal-type <type> --recipe-id <id> [options]\n`);
-  process.stdout.write(`  status --run-id <id> [options]\n\n`);
-  process.stdout.write(`  dag-compile --request <path> [options]    Compile request markdown into DAG manifest + parts\n`);
-  process.stdout.write(`  dag-run --manifest <path> [options]       Run dependency-aware DAG modules\n\n`);
+  process.stdout.write(`  status --run-id <id> [options]\n`);
+  process.stdout.write(`  rag-index [options]                  Build local RAG index\n`);
+  process.stdout.write(`  rag-query --query <q> [options]      Query local RAG index\n`);
+  process.stdout.write(`  rag-serve [options]                  Serve retrieval API over HTTP\n`);
+  process.stdout.write(`  synthesize-tasks [options]           Create request.md from discovery + RAG\n`);
+  process.stdout.write(`  dag-compile --request <path> [options]\n`);
+  process.stdout.write(`  dag-run --manifest <path> [options]\n`);
+  process.stdout.write(`  skills-autogen --manifest <path> [options]\n`);
+  process.stdout.write(`  auto-run --goal-type <type> --recipe-id <id> [options]\n\n`);
+
   process.stdout.write(`Common options:\n`);
-  process.stdout.write(`  --workspace-root <path>      (default: .)\n`);
-  process.stdout.write(`  --runs-dir <path>            (default: generated/orchestration/standalone/runs)\n`);
+  process.stdout.write(`  --workspace-root <path>      (default: INIT_CWD or .)\n`);
+  process.stdout.write(`  --json-out <path>            Write JSON to file\n`);
   process.stdout.write(`  --run-id <id>\n`);
-  process.stdout.write(`  --mode dry-run|apply         (default: dry-run)\n`);
+  process.stdout.write(`  --runs-dir <path>            (default: generated/orchestration/standalone/runs)\n`);
+  process.stdout.write(`  --mode dry-run|apply         (recipe cycle mode; default: dry-run)\n`);
   process.stdout.write(`  --source-policy primary_only|primary_plus_curated_secondary|open_web\n`);
   process.stdout.write(`  --risk-gate-mode strict_blockers|warn_then_apply|manual_override\n`);
   process.stdout.write(`  --wave-strategy incremental_dual_build|pilot_wave|big_bang|custom\n`);
   process.stdout.write(`  --curated-domain <domain>    (repeatable)\n`);
-  process.stdout.write(`  --no-require-tdd-tests\n`);
-  process.stdout.write(`  --dependency <sequential|parallel|staged> (dag-compile)\n`);
-  process.stdout.write(`  --output-dir <path>          (dag-compile; default generated/orchestration/dag)\n`);
-  process.stdout.write(`  --executor <cmd-template>    (dag-run; placeholders {id} {title} {partFile} {requestPath})\n`);
-  process.stdout.write(`  --fail-policy <graph|global> (dag-run; default graph)\n`);
-  process.stdout.write(`  --timeout-ms <n>             (dag-run command timeout)\n`);
-  process.stdout.write(`  --dry-run                    (dag-run without executing commands)\n`);
-  process.stdout.write(`  --json-out <path>            Write JSON to file\n`);
+  process.stdout.write(`  --no-require-tdd-tests\n\n`);
+
+  process.stdout.write(`RAG options:\n`);
+  process.stdout.write(`  --index-path <path>          (default: generated/orchestration/rag/index.json)\n`);
+  process.stdout.write(`  --query <text>               (rag-query)\n`);
+  process.stdout.write(`  --top-k <n>                  (default: 8)\n`);
+  process.stdout.write(`  --max-files <n>              (rag-index; default: 3000)\n`);
+  process.stdout.write(`  --lines-per-chunk <n>        (rag-index; default: 120)\n`);
+  process.stdout.write(`  --max-chars-per-chunk <n>    (rag-index; default: 5000)\n`);
+  process.stdout.write(`  --host <addr>                (rag-serve; default: 127.0.0.1)\n`);
+  process.stdout.write(`  --port <n>                   (rag-serve; default: 8787)\n\n`);
+
+  process.stdout.write(`DAG options:\n`);
+  process.stdout.write(`  --request <path>             (dag-compile)\n`);
+  process.stdout.write(`  --dependency <sequential|parallel|staged>\n`);
+  process.stdout.write(`  --output-dir <path>          (dag-compile; default: generated/orchestration/dag)\n`);
+  process.stdout.write(`  --manifest <path>            (dag-run / skills-autogen)\n`);
+  process.stdout.write(`  --executor <cmd-template>    placeholders: {id} {title} {partFile} {requestPath}\n`);
+  process.stdout.write(`  --executor-profile <none|codex-safe>\n`);
+  process.stdout.write(`  --apply-mode <dry-run|apply> (dag-run; default: dry-run)\n`);
+  process.stdout.write(`  --apply-guard-token <token>  (required for apply mode unless matching default guard)\n`);
+  process.stdout.write(`  --apply-guard-value <token>  (default guard is ALLOW_APPLY)\n`);
+  process.stdout.write(`  --fail-policy <graph|global> (default: graph)\n`);
+  process.stdout.write(`  --timeout-ms <n>             command timeout\n`);
+  process.stdout.write(`  --dry-run                    skip executing module commands in dag-run\n\n`);
+
+  process.stdout.write(`Autonomy options:\n`);
+  process.stdout.write(`  --discovery-file <path>      input for synthesize-tasks\n`);
+  process.stdout.write(`  --rag-index <path>           input for synthesize-tasks\n`);
+  process.stdout.write(`  --request-out <path>         synthesized request path\n`);
+  process.stdout.write(`  --max-tasks <n>              cap synthesized tasks\n`);
+  process.stdout.write(`  --compile-dag                synthesize command also compiles DAG\n`);
+  process.stdout.write(`  --run-summary <path>         run summary path for skills-autogen\n`);
+  process.stdout.write(`  --skills-dir <path>          output dir for generated skills\n`);
+  process.stdout.write(`  --min-occurrences <n>        threshold for auto skills\n`);
+  process.stdout.write(`  --apply-skills               write generated skills\n`);
+  process.stdout.write(`  --auto-skills <off|suggest|apply> (auto-run; default: suggest)\n`);
+  process.stdout.write(`  --autonomy-dir <path>        (auto-run output root; default: generated/orchestration/autonomy)\n`);
 }
 
 function parseGoal(args: ParsedArgs): ReturnType<typeof OrchestrationGoalSchema.parse> {
@@ -113,12 +170,9 @@ function parseGoal(args: ParsedArgs): ReturnType<typeof OrchestrationGoalSchema.
     throw new Error("--goal-type and --recipe-id are required");
   }
 
-  const sourcePolicyRaw = option(args, "source-policy", "primary_plus_curated_secondary") as string;
-  const riskGateModeRaw = option(args, "risk-gate-mode", "strict_blockers") as string;
+  const sourcePolicy = SourcePolicySchema.parse(option(args, "source-policy", "primary_plus_curated_secondary"));
+  const riskGateMode = RiskGateModeSchema.parse(option(args, "risk-gate-mode", "strict_blockers"));
   const waveStrategyRaw = option(args, "wave-strategy");
-
-  const sourcePolicy = SourcePolicySchema.parse(sourcePolicyRaw);
-  const riskGateMode = RiskGateModeSchema.parse(riskGateModeRaw);
   const waveStrategy = waveStrategyRaw ? WaveStrategySchema.parse(waveStrategyRaw) : undefined;
 
   return OrchestrationGoalSchema.parse({
@@ -130,7 +184,7 @@ function parseGoal(args: ParsedArgs): ReturnType<typeof OrchestrationGoalSchema.
     sourcePolicy,
     riskGateMode,
     waveStrategy,
-    requireTddTests: option(args, "no-require-tdd-tests") ? false : true,
+    requireTddTests: flag(args, "no-require-tdd-tests") ? false : true,
     curatedSourceDomains: optionList(args, "curated-domain"),
   });
 }
@@ -142,18 +196,16 @@ async function commandRecipes(args: ParsedArgs): Promise<void> {
     title: recipe.title,
     version: recipe.version,
   }));
-  writeJson(option(args, "json-out"), catalog);
+  writeJson(option(args, "json-out"), catalog, defaultWorkspaceRoot());
 }
 
 async function commandDiscover(args: ParsedArgs): Promise<void> {
   const recipeId = option(args, "recipe-id");
   if (!recipeId) throw new Error("--recipe-id is required for discover");
 
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
   const recipe = getRecipeById(recipeId);
-  const workspaceRoot = option(args, "workspace-root", ".") as string;
-  const sourcePolicy = SourcePolicySchema.parse(
-    option(args, "source-policy", "primary_plus_curated_secondary"),
-  );
+  const sourcePolicy = SourcePolicySchema.parse(option(args, "source-policy", "primary_plus_curated_secondary"));
 
   const facts = discoverWorkspaceFacts(workspaceRoot);
   const evidence = await collectInternetEvidence({
@@ -162,33 +214,31 @@ async function commandDiscover(args: ParsedArgs): Promise<void> {
     curatedDomains: optionList(args, "curated-domain"),
   });
 
-  writeJson(option(args, "json-out"), {
-    recipeId: recipe.id,
-    workspaceFacts: facts,
-    localSummary: summarizeWorkspaceFacts(facts),
-    internetEvidence: evidence,
-  });
+  writeJson(
+    option(args, "json-out"),
+    {
+      recipeId: recipe.id,
+      workspaceFacts: facts,
+      localSummary: summarizeWorkspaceFacts(facts),
+      internetEvidence: evidence,
+    },
+    workspaceRoot,
+  );
 }
 
 async function commandPlan(args: ParsedArgs): Promise<void> {
   const goal = parseGoal(args);
-  const mode = (option(args, "mode", "dry-run") as "dry-run" | "apply");
+  const mode = option(args, "mode", "dry-run") as "dry-run" | "apply";
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const runId = option(args, "run-id");
 
-  const cycle = await runOrchestrationCycle({
-    runId,
-    goal,
-    mode,
-    runsDir,
-  });
-
+  const cycle = await runOrchestrationCycle({ runId, goal, mode, runsDir });
   writeJson(option(args, "json-out"), {
     runId: cycle.runId,
     plan: cycle.plan,
     validation: cycle.validation,
     persistedPaths: cycle.persistedPaths,
-  });
+  }, goal.workspaceRoot);
 }
 
 async function commandValidate(args: ParsedArgs): Promise<void> {
@@ -198,45 +248,32 @@ async function commandValidate(args: ParsedArgs): Promise<void> {
   const parsed = JSON.parse(readFileSync(path.resolve(planPath), "utf8"));
   const plan = ExecutionPlanSchema.parse(parsed);
   const validation = validatePlan(plan);
-
-  writeJson(option(args, "json-out"), validation);
+  writeJson(option(args, "json-out"), validation, defaultWorkspaceRoot());
 }
 
 async function commandExecute(args: ParsedArgs): Promise<void> {
   const goal = parseGoal(args);
-  const mode = (option(args, "mode", "dry-run") as "dry-run" | "apply");
+  const mode = option(args, "mode", "dry-run") as "dry-run" | "apply";
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const runId = option(args, "run-id");
 
-  const cycle = await runOrchestrationCycle({
-    runId,
-    goal,
-    mode,
-    runsDir,
-  });
-
+  const cycle = await runOrchestrationCycle({ runId, goal, mode, runsDir });
   writeJson(option(args, "json-out"), {
     runId: cycle.runId,
     execution: cycle.execution,
     validation: cycle.validation,
     state: cycle.state,
     persistedPaths: cycle.persistedPaths,
-  });
+  }, goal.workspaceRoot);
 }
 
 async function commandCycle(args: ParsedArgs): Promise<void> {
   const goal = parseGoal(args);
-  const mode = (option(args, "mode", "dry-run") as "dry-run" | "apply");
+  const mode = option(args, "mode", "dry-run") as "dry-run" | "apply";
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const runId = option(args, "run-id");
 
-  const cycle = await runOrchestrationCycle({
-    runId,
-    goal,
-    mode,
-    runsDir,
-  });
-
+  const cycle = await runOrchestrationCycle({ runId, goal, mode, runsDir });
   writeJson(option(args, "json-out"), {
     runId: cycle.runId,
     summary: cycle.cycleSummary,
@@ -244,15 +281,117 @@ async function commandCycle(args: ParsedArgs): Promise<void> {
     execution: cycle.execution,
     validation: cycle.validation,
     persistedPaths: cycle.persistedPaths,
-  });
+  }, goal.workspaceRoot);
 }
 
 async function commandStatus(args: ParsedArgs): Promise<void> {
   const runId = option(args, "run-id");
   if (!runId) throw new Error("--run-id is required for status");
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
   const runsDir = option(args, "runs-dir", "generated/orchestration/standalone/runs") as string;
   const state = getRunStatus({ runId, runsDir });
-  writeJson(option(args, "json-out"), state);
+  writeJson(option(args, "json-out"), state, workspaceRoot);
+}
+
+async function commandRagIndex(args: ParsedArgs): Promise<void> {
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const indexPath = option(args, "index-path", "generated/orchestration/rag/index.json") as string;
+
+  const index = buildRagIndex({
+    workspaceRoot,
+    maxFiles: parseNumber(args, "max-files", 3000),
+    linesPerChunk: parseNumber(args, "lines-per-chunk", 120),
+    maxCharsPerChunk: parseNumber(args, "max-chars-per-chunk", 5000),
+  });
+
+  const savedPath = saveRagIndex({
+    index,
+    outputPath: path.isAbsolute(indexPath) ? indexPath : path.resolve(workspaceRoot, indexPath),
+  });
+
+  writeJson(option(args, "json-out"), {
+    savedPath,
+    fileCount: index.fileCount,
+    chunkCount: index.chunkCount,
+    generatedAt: index.generatedAt,
+  }, workspaceRoot);
+}
+
+async function commandRagQuery(args: ParsedArgs): Promise<void> {
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const indexPath = option(args, "index-path", "generated/orchestration/rag/index.json") as string;
+  const query = option(args, "query");
+
+  if (!query || !query.trim()) {
+    throw new Error("--query is required for rag-query");
+  }
+
+  const index = loadRagIndex(path.isAbsolute(indexPath) ? indexPath : path.resolve(workspaceRoot, indexPath));
+  const result = queryRagIndex({
+    index,
+    query,
+    topK: parseNumber(args, "top-k", 8),
+    filePathIncludes: option(args, "path"),
+  });
+
+  writeJson(option(args, "json-out"), result, workspaceRoot);
+}
+
+async function commandRagServe(args: ParsedArgs): Promise<void> {
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const indexPath = option(args, "index-path", "generated/orchestration/rag/index.json") as string;
+  const host = option(args, "host", "127.0.0.1") as string;
+  const port = parseNumber(args, "port", 8787);
+
+  const server = startRagServer({
+    indexPath: path.isAbsolute(indexPath) ? indexPath : path.resolve(workspaceRoot, indexPath),
+    host,
+    port,
+  });
+
+  process.stdout.write(`${JSON.stringify({ ok: true, host, port }, null, 2)}\n`);
+
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      server.close(() => resolve());
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  });
+}
+
+async function commandSynthesizeTasks(args: ParsedArgs): Promise<void> {
+  const goal = parseGoal(args);
+  const workspaceRoot = goal.workspaceRoot;
+  const requestOut = option(args, "request-out", "generated/orchestration/autonomy/request.generated.md") as string;
+
+  const synthesized = synthesizeTaskRequest({
+    workspaceRoot,
+    goalType: goal.goalType,
+    recipeId: goal.recipeId,
+    discoveryPath: option(args, "discovery-file"),
+    ragIndexPath: option(args, "rag-index"),
+    outputPath: requestOut,
+    maxTasks: parseNumber(args, "max-tasks", 24),
+  });
+
+  let manifestPath: string | null = null;
+  if (flag(args, "compile-dag")) {
+    const outputDir = option(args, "output-dir", "generated/orchestration/autonomy/dag") as string;
+    await compileRequestDag({
+      workspaceRoot,
+      requestPath: path.relative(workspaceRoot, synthesized.requestPath).replace(/\\/g, "/"),
+      outputDir,
+      dependencyMode: DagDependencyModeSchema.parse(option(args, "dependency", "staged")),
+    });
+    manifestPath = path.resolve(workspaceRoot, outputDir, "manifest.json");
+  }
+
+  writeJson(option(args, "json-out"), {
+    requestPath: synthesized.requestPath,
+    taskCount: synthesized.taskCount,
+    manifestPath,
+  }, workspaceRoot);
 }
 
 async function commandDagCompile(args: ParsedArgs): Promise<void> {
@@ -285,20 +424,30 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     throw new Error("--fail-policy must be graph or global");
   }
 
-  const timeoutRaw = option(args, "timeout-ms");
-  const timeoutMs = timeoutRaw ? Number(timeoutRaw) : undefined;
-  if (timeoutRaw && (!Number.isFinite(timeoutMs) || (timeoutMs as number) < 1)) {
-    throw new Error("--timeout-ms must be a positive number");
+  const executorProfileRaw = option(args, "executor-profile", "none");
+  if (executorProfileRaw !== "none" && executorProfileRaw !== "codex-safe") {
+    throw new Error("--executor-profile must be none or codex-safe");
   }
+
+  const applyModeRaw = option(args, "apply-mode", "dry-run");
+  if (applyModeRaw !== "dry-run" && applyModeRaw !== "apply") {
+    throw new Error("--apply-mode must be dry-run or apply");
+  }
+
+  const timeoutMs = parseNumber(args, "timeout-ms", 10 * 60 * 1000);
 
   const summary = runDag({
     workspaceRoot,
     manifestPath,
     executorTemplate: option(args, "executor"),
+    executorProfile: executorProfileRaw,
+    applyMode: applyModeRaw,
+    applyGuardToken: option(args, "apply-guard-token"),
+    applyGuardValue: option(args, "apply-guard-value"),
     failPolicy: failPolicyRaw,
-    timeoutMs: timeoutMs as number | undefined,
+    timeoutMs,
     outputPath: option(args, "json-out"),
-    dryRun: option(args, "dry-run") === "true",
+    dryRun: flag(args, "dry-run"),
   });
 
   if (!option(args, "json-out")) {
@@ -308,6 +457,135 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
       `${JSON.stringify({ ok: true, status: summary.status, outputPath: option(args, "json-out") }, null, 2)}\n`,
     );
   }
+}
+
+async function commandSkillsAutogen(args: ParsedArgs): Promise<void> {
+  const manifestPath = option(args, "manifest");
+  if (!manifestPath) throw new Error("--manifest <path> is required for skills-autogen");
+
+  const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
+  const result = autoGenerateSkills({
+    workspaceRoot,
+    manifestPath,
+    runSummaryPath: option(args, "run-summary"),
+    outputDir: option(args, "skills-dir", ".codex/skills/generated"),
+    minOccurrences: parseNumber(args, "min-occurrences", 2),
+    apply: flag(args, "apply-skills"),
+  });
+
+  writeJson(option(args, "json-out"), result, workspaceRoot);
+}
+
+async function commandAutoRun(args: ParsedArgs): Promise<void> {
+  const goal = parseGoal(args);
+  const workspaceRoot = goal.workspaceRoot;
+  const autonomyDir = option(args, "autonomy-dir", "generated/orchestration/autonomy") as string;
+
+  const discoveryPath = path.resolve(workspaceRoot, autonomyDir, "discovery.json");
+  const ragIndexPath = path.resolve(workspaceRoot, autonomyDir, "rag", "index.json");
+  const requestPath = path.resolve(workspaceRoot, option(args, "request-out", `${autonomyDir}/request.generated.md`) as string);
+  const dagOutputDir = option(args, "output-dir", `${autonomyDir}/dag`) as string;
+  const dagManifestPath = path.resolve(workspaceRoot, dagOutputDir, "manifest.json");
+  const dagRunSummaryPath = path.resolve(workspaceRoot, autonomyDir, "dag", "run-summary.json");
+
+  const recipe = getRecipeById(goal.recipeId);
+  const facts = discoverWorkspaceFacts(workspaceRoot);
+  const evidence = await collectInternetEvidence({
+    sources: recipe.discoverySources,
+    policy: goal.sourcePolicy,
+    curatedDomains: goal.curatedSourceDomains,
+  });
+
+  writeJson(
+    path.relative(workspaceRoot, discoveryPath),
+    {
+      recipeId: recipe.id,
+      workspaceFacts: facts,
+      localSummary: summarizeWorkspaceFacts(facts),
+      internetEvidence: evidence,
+    },
+    workspaceRoot,
+  );
+
+  const ragIndex = buildRagIndex({
+    workspaceRoot,
+    maxFiles: parseNumber(args, "max-files", 3000),
+  });
+  saveRagIndex({ index: ragIndex, outputPath: ragIndexPath });
+
+  const synthesized = synthesizeTaskRequest({
+    workspaceRoot,
+    goalType: goal.goalType,
+    recipeId: goal.recipeId,
+    discoveryPath,
+    ragIndexPath,
+    outputPath: path.relative(workspaceRoot, requestPath),
+    maxTasks: parseNumber(args, "max-tasks", 24),
+  });
+
+  await compileRequestDag({
+    workspaceRoot,
+    requestPath: path.relative(workspaceRoot, synthesized.requestPath).replace(/\\/g, "/"),
+    outputDir: dagOutputDir,
+    dependencyMode: DagDependencyModeSchema.parse(option(args, "dependency", "staged")),
+  });
+
+  const executorProfileRaw = option(args, "executor-profile", "codex-safe");
+  if (executorProfileRaw !== "none" && executorProfileRaw !== "codex-safe") {
+    throw new Error("--executor-profile must be none or codex-safe");
+  }
+
+  const applyModeRaw = option(args, "apply-mode", "dry-run");
+  if (applyModeRaw !== "dry-run" && applyModeRaw !== "apply") {
+    throw new Error("--apply-mode must be dry-run or apply");
+  }
+
+  const dagSummary = runDag({
+    workspaceRoot,
+    manifestPath: path.relative(workspaceRoot, dagManifestPath),
+    executorTemplate: option(args, "executor"),
+    executorProfile: executorProfileRaw,
+    applyMode: applyModeRaw,
+    applyGuardToken: option(args, "apply-guard-token"),
+    applyGuardValue: option(args, "apply-guard-value"),
+    failPolicy: (option(args, "fail-policy", "graph") as "graph" | "global"),
+    timeoutMs: parseNumber(args, "timeout-ms", 10 * 60 * 1000),
+    outputPath: path.relative(workspaceRoot, dagRunSummaryPath),
+    dryRun: flag(args, "dry-run"),
+  });
+
+  const autoSkillsMode = option(args, "auto-skills", "suggest");
+  if (autoSkillsMode !== "off" && autoSkillsMode !== "suggest" && autoSkillsMode !== "apply") {
+    throw new Error("--auto-skills must be off, suggest, or apply");
+  }
+
+  const autoSkills = autoSkillsMode === "off"
+    ? { candidates: [], created: [] }
+    : autoGenerateSkills({
+      workspaceRoot,
+      manifestPath: path.relative(workspaceRoot, dagManifestPath),
+      runSummaryPath: path.relative(workspaceRoot, dagRunSummaryPath),
+      outputDir: option(args, "skills-dir", ".codex/skills/generated"),
+      minOccurrences: parseNumber(args, "min-occurrences", 2),
+      apply: autoSkillsMode === "apply",
+    });
+
+  const summary = {
+    goal,
+    artifacts: {
+      discoveryPath: path.relative(workspaceRoot, discoveryPath).replace(/\\/g, "/"),
+      ragIndexPath: path.relative(workspaceRoot, ragIndexPath).replace(/\\/g, "/"),
+      requestPath: path.relative(workspaceRoot, synthesized.requestPath).replace(/\\/g, "/"),
+      dagManifestPath: path.relative(workspaceRoot, dagManifestPath).replace(/\\/g, "/"),
+      dagRunSummaryPath: path.relative(workspaceRoot, dagRunSummaryPath).replace(/\\/g, "/"),
+    },
+    dagStatus: dagSummary.status,
+    synthesizedTaskCount: synthesized.taskCount,
+    autoSkills,
+    generatedAt: new Date().toISOString(),
+  };
+
+  writeJson(option(args, "json-out", `${autonomyDir}/auto-run-summary.json`), summary, workspaceRoot);
 }
 
 async function main(): Promise<void> {
@@ -340,11 +618,29 @@ async function main(): Promise<void> {
     case "status":
       await commandStatus(parsed);
       return;
+    case "rag-index":
+      await commandRagIndex(parsed);
+      return;
+    case "rag-query":
+      await commandRagQuery(parsed);
+      return;
+    case "rag-serve":
+      await commandRagServe(parsed);
+      return;
+    case "synthesize-tasks":
+      await commandSynthesizeTasks(parsed);
+      return;
     case "dag-compile":
       await commandDagCompile(parsed);
       return;
     case "dag-run":
       await commandDagRun(parsed);
+      return;
+    case "skills-autogen":
+      await commandSkillsAutogen(parsed);
+      return;
+    case "auto-run":
+      await commandAutoRun(parsed);
       return;
     default:
       throw new Error(`Unknown command '${parsed.command}'. Use 'help'.`);

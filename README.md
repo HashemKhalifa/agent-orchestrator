@@ -4,10 +4,21 @@ Standalone, recipe-driven orchestration engine for cross-repo migrations and ref
 
 This repo packages a reusable orchestration core with deep discovery, strict risk gating, and loop execution.
 
+## Reuse In Another Repo
+
+```bash
+git clone git@github.com:HashemKhalifa/orchestrator-core.git tools/orchestrator-core
+npm --prefix tools/orchestrator-core/packages/orchestrator-standalone install
+npm --prefix tools/orchestrator-core/packages/orchestrator-standalone run cli -- recipes
+```
+
+You can also package `packages/orchestrator-standalone` and publish/install it as an internal npm package.
+
 ## Structure
 
 - `packages/orchestrator-standalone` - core package (spec, adapters, kernel, recipes, CLI)
 - `scripts/run-standalone-orchestrator-until-done.sh` - run-until-done controller
+- `scripts/run-bot-request-until-done.sh` - autonomous discovery -> RAG -> DAG -> execute loop
 - `unpack.config.ts` - request-splitting strategy config used by DAG compiler
 - `.codex/skills` - reusable Codex skills (system + project skills)
 
@@ -36,4 +47,14 @@ npm --prefix packages/orchestrator-standalone run cli -- dag-compile --request r
 npm --prefix packages/orchestrator-standalone run cli -- dag-run \
   --manifest generated/orchestration/dag/manifest.json \
   --executor "codex exec --full-auto \"Process {partFile}\""
+```
+
+Autonomous end-to-end loop (recipe + RAG + DAG + execution + optional skill autogen):
+
+```bash
+bash scripts/run-bot-request-until-done.sh \
+  --goal-type build_migration \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --executor-profile codex-safe \
+  --apply-mode dry-run
 ```

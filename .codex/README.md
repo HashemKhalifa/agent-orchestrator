@@ -6,5 +6,9 @@ This repo includes:
 - Project skills:
   - `.codex/skills/orchestration-dag`
   - `.codex/skills/monorepo-migration`
+  - `.codex/skills/autonomous-orchestration`
+  - `.codex/skills/react19-upgrade`
+  - `.codex/skills/jest-to-vitest`
+  - `.codex/skills/ci-modernization`
 
 System skills were imported from `monolith-rs` commit `017b708ed35bb5a3c5d6aecbc186cad31beaa99f`.

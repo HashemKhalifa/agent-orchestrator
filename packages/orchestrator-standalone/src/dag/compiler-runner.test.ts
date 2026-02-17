@@ -47,4 +47,32 @@ describe("request DAG compile/run", () => {
     expect(summary.status).toBe("success");
     expect(existsSync(path.join(root, "generated", "orchestration", "dag", "run-summary.json"))).toBe(true);
   });
+
+  it("blocks apply mode when guard token is missing", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-core-dag-guard-"));
+    cleanupPaths.push(root);
+
+    const requestPath = path.join(root, "request.md");
+    writeFileSync(
+      requestPath,
+      `# Request\n\n## Scope\nSmall scope.\n\n## Task\nDo one thing.\n`,
+      "utf8",
+    );
+
+    await compileRequestDag({
+      workspaceRoot: root,
+      requestPath: "request.md",
+      outputDir: "generated/orchestration/dag",
+      dependencyMode: "staged",
+    });
+
+    expect(() =>
+      runDag({
+        workspaceRoot: root,
+        manifestPath: "generated/orchestration/dag/manifest.json",
+        executorProfile: "codex-safe",
+        applyMode: "apply",
+      }),
+    ).toThrow(/Apply mode blocked/);
+  });
 });

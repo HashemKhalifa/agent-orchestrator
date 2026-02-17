@@ -14,6 +14,11 @@
     "cli": "tsx src/cli.ts",
     "dag:compile": "tsx src/cli.ts dag-compile",
     "dag:run": "tsx src/cli.ts dag-run",
+    "rag:index": "tsx src/cli.ts rag-index",
+    "rag:query": "tsx src/cli.ts rag-query",
+    "autonomy:auto-run": "tsx src/cli.ts auto-run",
+    "autonomy:synthesize": "tsx src/cli.ts synthesize-tasks",
+    "skills:autogen": "tsx src/cli.ts skills-autogen",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:run": "vitest run src/**/*.test.ts"
   },

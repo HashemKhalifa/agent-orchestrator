@@ -6,3 +6,8 @@ export * from "./kernel/orchestrator.js";
 export * from "./dag/types.js";
 export * from "./dag/compiler.js";
 export * from "./dag/runner.js";
+export * from "./rag/types.js";
+export * from "./rag/indexer.js";
+export * from "./rag/retriever.js";
+export * from "./autonomy/task-synthesizer.js";
+export * from "./skills/autogen.js";
