@@ -8,6 +8,9 @@ import type { EdgeRef, ModuleStatus, NodeState, RunStateResponse } from "./types
 
 const DEFAULT_WORKSPACE_ROOT = "packages/orchestrator-standalone";
 const DEFAULT_AUTONOMY_DIR = "generated/orchestration/autonomy";
+const INITIAL_QUERY = typeof window === "undefined" ? null : new URLSearchParams(window.location.search);
+const INITIAL_WORKSPACE_ROOT = INITIAL_QUERY?.get("workspaceRoot")?.trim() || DEFAULT_WORKSPACE_ROOT;
+const INITIAL_AUTONOMY_DIR = INITIAL_QUERY?.get("autonomyDir")?.trim() || DEFAULT_AUTONOMY_DIR;
 
 const statuses: ModuleStatus[] = ["success", "failed", "blocked", "skipped", "pending"];
 
@@ -22,8 +25,8 @@ const defaultStatusFilter: StatusFilter = {
 };
 
 export default function App(): JSX.Element {
-  const [workspaceRoot, setWorkspaceRoot] = useState(DEFAULT_WORKSPACE_ROOT);
-  const [autonomyDir, setAutonomyDir] = useState(DEFAULT_AUTONOMY_DIR);
+  const [workspaceRoot, setWorkspaceRoot] = useState(INITIAL_WORKSPACE_ROOT);
+  const [autonomyDir, setAutonomyDir] = useState(INITIAL_AUTONOMY_DIR);
   const [pollMs, setPollMs] = useState(2000);
   const [paused, setPaused] = useState(false);
   const [transport, setTransport] = useState<"stream" | "poll">("stream");
@@ -66,6 +69,14 @@ export default function App(): JSX.Element {
   useEffect(() => {
     void loadState();
   }, [loadState]);
+
+  useEffect(() => {
+    const query = new URLSearchParams(window.location.search);
+    query.set("workspaceRoot", workspaceRoot);
+    query.set("autonomyDir", autonomyDir);
+    const next = `${window.location.pathname}?${query.toString()}`;
+    window.history.replaceState(null, "", next);
+  }, [workspaceRoot, autonomyDir]);
 
   useEffect(() => {
     if (paused) return;
