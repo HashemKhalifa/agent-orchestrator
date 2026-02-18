@@ -6,4 +6,4 @@ cd "$ROOT_DIR"
 
 MANIFEST_PATH="${1:-generated/orchestration/dag/manifest.json}"
 
-npm --prefix packages/orchestrator-standalone run cli -- dag-run --manifest "$MANIFEST_PATH" "${@:2}"
+bash scripts/run-orchestrator-cli.sh dag-run --manifest "$MANIFEST_PATH" "${@:2}"

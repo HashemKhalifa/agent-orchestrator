@@ -21,5 +21,21 @@ Execute safely and include validation evidence.
 PROMPT_EOF
 )
 
+STDOUT_FILE="$(mktemp)"
+STDERR_FILE="$(mktemp)"
+cleanup() {
+  rm -f "$STDOUT_FILE" "$STDERR_FILE"
+}
+trap cleanup EXIT
+
+set +e
 # shellcheck disable=SC2086
-$OPENAI_CMD "$PROMPT"
+$OPENAI_CMD "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+STATUS="$?"
+set -e
+
+cat "$STDOUT_FILE"
+cat "$STDERR_FILE" >&2
+bash "$(dirname "$0")/emit-token-receipt.sh" "openai" "$STDOUT_FILE" "$STDERR_FILE" || true
+
+exit "$STATUS"

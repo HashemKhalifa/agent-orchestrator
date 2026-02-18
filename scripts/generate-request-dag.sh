@@ -6,4 +6,4 @@ cd "$ROOT_DIR"
 
 REQUEST_PATH="${1:-request.md}"
 
-npm --prefix packages/orchestrator-standalone run cli -- dag-compile --request "$REQUEST_PATH" "${@:2}"
+bash scripts/run-orchestrator-cli.sh dag-compile --request "$REQUEST_PATH" "${@:2}"

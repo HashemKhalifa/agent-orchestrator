@@ -302,7 +302,7 @@ for ((cycle=1; cycle<=MAX_CYCLES; cycle++)); do
   CYCLE_JSON_PATH="$(mktemp /tmp/orchestrator-cycle-XXXXXX)"
 
   CMD=(
-    npm --prefix packages/orchestrator-standalone run cli --
+    bash scripts/run-orchestrator-cli.sh
     cycle
     --goal-type "$GOAL_TYPE"
     --workspace-root "$WORKSPACE_ROOT"
