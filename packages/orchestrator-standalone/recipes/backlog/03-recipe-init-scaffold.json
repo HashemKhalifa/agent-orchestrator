@@ -1,0 +1,107 @@
+{
+  "id": "backlog-recipe-init-scaffold",
+  "version": "1.0.0",
+  "title": "Recipe Init Scaffold Command",
+  "description": "Add a `recipe-init` command that scaffolds a new recipe file from minimal inputs and optional workspace hints.",
+  "goalType": "custom",
+  "defaultWaveStrategy": "pilot_wave",
+  "preconditions": {
+    "packageManagers": [
+      "npm",
+      "pnpm",
+      "yarn",
+      "unknown"
+    ],
+    "requiresFiles": [
+      "packages/orchestrator-standalone/src/cli.ts",
+      "packages/orchestrator-standalone/src/spec/schemas.ts"
+    ],
+    "requiresBuildTools": []
+  },
+  "discoverySources": [
+    {
+      "id": "json-schema-ux",
+      "title": "Schema-driven scaffolding patterns",
+      "url": "https://json-schema.org/learn/getting-started-step-by-step",
+      "type": "curated_secondary",
+      "tags": [
+        "scaffolding",
+        "schema"
+      ]
+    }
+  ],
+  "riskProbes": [
+    {
+      "id": "invalid-recipe-shape",
+      "title": "Generated recipe fails schema validation",
+      "category": "compatibility",
+      "severity": "high",
+      "regex": "ExecutionRecipeSchema",
+      "fileGlobsHint": [
+        "packages/orchestrator-standalone/src/**/*.ts"
+      ],
+      "advice": "Validate scaffold output through ExecutionRecipeSchema before writing."
+    }
+  ],
+  "steps": [
+    {
+      "id": "define-template-contract",
+      "title": "Define scaffold contract",
+      "kind": "analyze",
+      "description": "Specify minimal required inputs and output file conventions for new recipes.",
+      "mutating": false
+    },
+    {
+      "id": "implement-recipe-init",
+      "title": "Implement recipe-init command",
+      "kind": "transform",
+      "description": "Generate starter recipe JSON with sane defaults and optional inferred preconditions.",
+      "mutating": true
+    },
+    {
+      "id": "validate-scaffold",
+      "title": "Add scaffold tests",
+      "kind": "verify",
+      "description": "Add tests that validate scaffolded recipe schema and CLI UX.",
+      "mutating": true
+    },
+    {
+      "id": "document-recipe-authoring",
+      "title": "Update recipe authoring docs",
+      "kind": "notify",
+      "description": "Add README guidance for creating and running new recipes end-to-end.",
+      "mutating": true
+    }
+  ],
+  "gates": [
+    {
+      "id": "gate-typecheck",
+      "title": "Typecheck passes",
+      "kind": "command",
+      "required": true,
+      "command": "npm --prefix packages/orchestrator-standalone run typecheck"
+    },
+    {
+      "id": "gate-tests",
+      "title": "CLI + recipe tests pass",
+      "kind": "command",
+      "required": true,
+      "command": "npm --prefix packages/orchestrator-standalone run test:run -- src/recipes/generator.test.ts src/autonomy/task-synthesizer.test.ts"
+    },
+    {
+      "id": "gate-risk-high",
+      "title": "No unresolved high/critical risks",
+      "kind": "risk",
+      "required": true,
+      "note": "Do not merge if scaffold can emit invalid or misleading recipes."
+    }
+  ],
+  "rollbackHints": [
+    "Keep existing recipe-generate and recipe-intake behavior unchanged.",
+    "Fail fast on invalid scaffold inputs instead of writing partial files."
+  ],
+  "edgeCases": [
+    "User provides recipe id that already exists in catalog.",
+    "Workspace has no package.json and inferred preconditions must fall back safely."
+  ]
+}

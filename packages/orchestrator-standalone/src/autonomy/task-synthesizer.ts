@@ -3,6 +3,8 @@ import path from "node:path";
 import { getRecipeById } from "../recipes/catalog.js";
 import { discoverWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import { loadRagIndex, queryRagIndex } from "../rag/retriever.js";
+import { runAutoRefineQuery } from "../rag/refine.js";
+import { recordReplayOutcome, suggestReplayQueries } from "../rag/replay-memory.js";
 import { ExecutionRecipeSchema, type ExecutionRecipe } from "../spec/schemas.js";
 
 interface DiscoveryPayload {
@@ -60,6 +62,23 @@ function renderDiscoveryEvidence(discovery: DiscoveryPayload): string {
 function renderRagEvidence(args: {
   ragIndexPath?: string;
   queries: string[];
+  workspaceRoot?: string;
+  recipeId?: string;
+  autoRefine?: boolean;
+  refineMaxIterations?: number;
+  refineMaxQueriesPerIteration?: number;
+  refineMaxQueries?: number;
+  refineMaxRuntimeMs?: number;
+  refineMaxTokenBudget?: number;
+  refineMaxStallIterations?: number;
+  refineConvergenceEpsilon?: number;
+  replayMemoryEnabled?: boolean;
+  replayMemoryPath?: string;
+  replayMaxEntries?: number;
+  replayMaxAgeDays?: number;
+  replayMinScore?: number;
+  replayMinSuccessCount?: number;
+  autonomyDir?: string;
 }): string {
   if (!args.ragIndexPath) return "- RAG index not provided.\n";
 
@@ -68,6 +87,101 @@ function renderRagEvidence(args: {
     index = loadRagIndex(args.ragIndexPath);
   } catch {
     return "- Failed to load RAG index.\n";
+  }
+
+  if (args.autoRefine) {
+    const seedQueries = args.queries.slice(0, 8);
+    if (seedQueries.length === 0) return "- No seed queries available for auto-refine.\n";
+
+    try {
+      const replayEnabled = (args.replayMemoryEnabled ?? true) && Boolean(args.workspaceRoot && args.recipeId);
+      const replay = replayEnabled && args.workspaceRoot && args.recipeId
+        ? suggestReplayQueries({
+          workspaceRoot: args.workspaceRoot,
+          recipeId: args.recipeId,
+          seedQueries,
+          maxQueries: 4,
+          autonomyDir: args.autonomyDir,
+          memoryPath: args.replayMemoryPath,
+          retentionMaxEntries: args.replayMaxEntries,
+          retentionMaxAgeDays: args.replayMaxAgeDays,
+          retentionMinScore: args.replayMinScore,
+          retentionMinSuccessCount: args.replayMinSuccessCount,
+        })
+        : null;
+
+      const replaySuggestions = replay?.querySuggestions ?? [];
+      const replaySeedQueries = Array.from(new Set([...seedQueries, ...replaySuggestions])).slice(0, 12);
+
+      const refined = runAutoRefineQuery({
+        index,
+        seedQueries: replaySeedQueries,
+        topK: 8,
+        maxIterations: args.refineMaxIterations,
+        maxQueriesPerIteration: args.refineMaxQueriesPerIteration,
+        maxQueries: args.refineMaxQueries,
+        maxRuntimeMs: args.refineMaxRuntimeMs,
+        maxTokenBudget: args.refineMaxTokenBudget,
+        maxStallIterations: args.refineMaxStallIterations,
+        convergenceEpsilon: args.refineConvergenceEpsilon,
+      });
+
+      if (refined.hits.length === 0) return "- Auto-refine ran, but no relevant RAG hits were found.\n";
+
+      const lines: string[] = [];
+      lines.push("### Auto-Refine Retrieval");
+      lines.push(`- Seed queries: ${refined.seedQueries.length}`);
+      lines.push(`- Replay memory suggestions: ${replaySuggestions.length}`);
+      if (replay?.memoryPath && args.workspaceRoot) {
+        const replayPath = path.relative(args.workspaceRoot, replay.memoryPath).replace(/\\/g, "/");
+        lines.push(`- Replay memory path: ${replayPath}`);
+      }
+      lines.push(`- Iterations used: ${refined.budget.usedIterations}/${refined.budget.maxIterations}`);
+      lines.push(`- Queries used: ${refined.budget.usedQueries}/${refined.budget.maxQueries}`);
+      lines.push(`- Token estimate: ${refined.budget.usedTokensEstimate}/${refined.budget.maxTokenBudget}`);
+      lines.push(`- Stall critic: ${refined.budget.stalledIterations}/${refined.budget.maxStallIterations}`);
+      lines.push(`- Stop reason: ${refined.budget.stopReason}`);
+
+      for (const iteration of refined.iterations) {
+        lines.push(`### Iteration ${iteration.iteration}`);
+        lines.push(`- queries: ${iteration.queriesUsed.join(" | ") || "none"}`);
+        lines.push(`- follow-ups: ${iteration.newQueries.join(" | ") || "none"}`);
+        lines.push(`- new unique hits: ${iteration.newUniqueHits}`);
+        lines.push(`- avg top score: ${iteration.avgTopScore.toFixed(4)}`);
+        lines.push(`- score delta: ${iteration.scoreDelta.toFixed(4)} (${iteration.critique})`);
+      }
+
+      lines.push("### Refined Top Hits");
+      for (const hit of refined.hits.slice(0, 10)) {
+        lines.push(
+          `- ${hit.filePath}:${hit.startLine} score=${hit.score.toFixed(4)} terms=[${hit.matchedTerms.join(", ")}]`,
+        );
+        lines.push(`  - ${hit.excerpt.replace(/\s+/g, " ").slice(0, 320)}`);
+      }
+
+      if (replayEnabled && args.workspaceRoot && args.recipeId && refined.hits.length > 0) {
+        try {
+          recordReplayOutcome({
+            workspaceRoot: args.workspaceRoot,
+            recipeId: args.recipeId,
+            seedQueries,
+            refined,
+            autonomyDir: args.autonomyDir,
+            memoryPath: args.replayMemoryPath,
+            retentionMaxEntries: args.replayMaxEntries,
+            retentionMaxAgeDays: args.replayMaxAgeDays,
+            retentionMinScore: args.replayMinScore,
+            retentionMinSuccessCount: args.replayMinSuccessCount,
+          });
+        } catch {
+          lines.push("- Replay memory update failed.");
+        }
+      }
+
+      return `${lines.join("\n")}\n`;
+    } catch {
+      return "- Auto-refine retrieval failed; falling back to basic retrieval.\n";
+    }
   }
 
   const lines: string[] = [];
@@ -99,6 +213,21 @@ export function synthesizeTaskRequest(args: {
   recipe?: ExecutionRecipe;
   discoveryPath?: string;
   ragIndexPath?: string;
+  ragAutoRefine?: boolean;
+  ragRefineMaxIterations?: number;
+  ragRefineMaxQueriesPerIteration?: number;
+  ragRefineMaxQueries?: number;
+  ragRefineMaxRuntimeMs?: number;
+  ragRefineMaxTokenBudget?: number;
+  ragRefineMaxStallIterations?: number;
+  ragRefineConvergenceEpsilon?: number;
+  ragReplayMemoryEnabled?: boolean;
+  ragReplayMemoryPath?: string;
+  ragReplayMaxEntries?: number;
+  ragReplayMaxAgeDays?: number;
+  ragReplayMinScore?: number;
+  ragReplayMinSuccessCount?: number;
+  autonomyDir?: string;
   outputPath: string;
   maxTasks?: number;
 }): { requestPath: string; taskCount: number } {
@@ -169,6 +298,9 @@ export function synthesizeTaskRequest(args: {
 ## Non-Negotiables
 - Preserve behavior parity unless explicitly changed.
 - Add test coverage before apply operations.
+- Run a critic pass per completed module before marking it done.
+- When a gate fails, run focused repair follow-up tasks instead of replaying full waves.
+- Emit a structured artifact contract per module (changes, tests, risk notes).
 - Block apply on unresolved high-risk findings.
 - Keep deterministic artifacts for each step.
 
@@ -184,7 +316,27 @@ export function synthesizeTaskRequest(args: {
 ${renderDiscoveryEvidence(discovery)}
 
 ## RAG Evidence (Repo + Docs)
-${renderRagEvidence({ ragIndexPath: args.ragIndexPath, queries })}
+${renderRagEvidence({
+  ragIndexPath: args.ragIndexPath,
+  queries,
+  workspaceRoot,
+  recipeId: recipe.id,
+  autoRefine: args.ragAutoRefine,
+  refineMaxIterations: args.ragRefineMaxIterations,
+  refineMaxQueriesPerIteration: args.ragRefineMaxQueriesPerIteration,
+  refineMaxQueries: args.ragRefineMaxQueries,
+  refineMaxRuntimeMs: args.ragRefineMaxRuntimeMs,
+  refineMaxTokenBudget: args.ragRefineMaxTokenBudget,
+  refineMaxStallIterations: args.ragRefineMaxStallIterations,
+  refineConvergenceEpsilon: args.ragRefineConvergenceEpsilon,
+  replayMemoryEnabled: args.ragReplayMemoryEnabled,
+  replayMemoryPath: args.ragReplayMemoryPath,
+  replayMaxEntries: args.ragReplayMaxEntries,
+  replayMaxAgeDays: args.ragReplayMaxAgeDays,
+  replayMinScore: args.ragReplayMinScore,
+  replayMinSuccessCount: args.ragReplayMinSuccessCount,
+  autonomyDir: args.autonomyDir,
+})}
 
 ## Implementation Scope
 ${trimmedTasks

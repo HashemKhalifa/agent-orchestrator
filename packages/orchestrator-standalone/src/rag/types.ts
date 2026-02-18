@@ -44,7 +44,44 @@ export const RagQueryResultSchema = z.object({
   hits: z.array(RagQueryHitSchema),
 });
 
+export const RagRefineIterationSchema = z.object({
+  iteration: z.number().int().positive(),
+  queriesUsed: z.array(z.string()),
+  newQueries: z.array(z.string()),
+  uniqueHitCount: z.number().int().nonnegative(),
+  newUniqueHits: z.number().int().nonnegative(),
+  avgTopScore: z.number().nonnegative(),
+  scoreDelta: z.number(),
+  critique: z.enum(["cold_start", "improving", "stalled", "degrading"]),
+});
+
+export const RagRefineBudgetSchema = z.object({
+  maxIterations: z.number().int().positive(),
+  maxQueries: z.number().int().positive(),
+  maxRuntimeMs: z.number().int().positive(),
+  maxTokenBudget: z.number().int().nonnegative(),
+  maxStallIterations: z.number().int().positive(),
+  convergenceEpsilon: z.number().nonnegative(),
+  usedIterations: z.number().int().nonnegative(),
+  usedQueries: z.number().int().nonnegative(),
+  usedTokensEstimate: z.number().int().nonnegative(),
+  elapsedMs: z.number().int().nonnegative(),
+  stalledIterations: z.number().int().nonnegative(),
+  stopReason: z.string(),
+});
+
+export const RagRefineResultSchema = z.object({
+  seedQueries: z.array(z.string()).min(1),
+  aggregatedQuery: z.string(),
+  hits: z.array(RagQueryHitSchema),
+  iterations: z.array(RagRefineIterationSchema),
+  budget: RagRefineBudgetSchema,
+});
+
 export type RagChunk = z.infer<typeof RagChunkSchema>;
 export type RagIndex = z.infer<typeof RagIndexSchema>;
 export type RagQueryHit = z.infer<typeof RagQueryHitSchema>;
 export type RagQueryResult = z.infer<typeof RagQueryResultSchema>;
+export type RagRefineIteration = z.infer<typeof RagRefineIterationSchema>;
+export type RagRefineBudget = z.infer<typeof RagRefineBudgetSchema>;
+export type RagRefineResult = z.infer<typeof RagRefineResultSchema>;

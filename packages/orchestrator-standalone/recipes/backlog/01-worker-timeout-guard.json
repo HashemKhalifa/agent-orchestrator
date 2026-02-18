@@ -1,0 +1,118 @@
+{
+  "id": "backlog-worker-timeout-guard",
+  "version": "1.0.0",
+  "title": "Worker Timeout Guard (Per-Module + Retry-Safe)",
+  "description": "Add strict module timeout defaults for queued auto-run jobs, ensure timed-out module attempts fail fast with repair/retry flow, and document override knobs.",
+  "goalType": "custom",
+  "defaultWaveStrategy": "pilot_wave",
+  "preconditions": {
+    "packageManagers": [
+      "npm",
+      "pnpm",
+      "yarn",
+      "unknown"
+    ],
+    "requiresFiles": [
+      "packages/orchestrator-standalone/src/cli.ts",
+      "packages/orchestrator-standalone/src/dag/runner.ts"
+    ],
+    "requiresBuildTools": []
+  },
+  "discoverySources": [
+    {
+      "id": "node-child-process-timeout",
+      "title": "Node child_process timeout behavior",
+      "url": "https://nodejs.org/api/child_process.html",
+      "type": "primary",
+      "tags": [
+        "timeout",
+        "process-control"
+      ]
+    }
+  ],
+  "riskProbes": [
+    {
+      "id": "missing-timeout-default",
+      "title": "Queued runs without timeout budget",
+      "category": "performance",
+      "severity": "high",
+      "regex": "worker-enqueue|recipe-intake",
+      "fileGlobsHint": [
+        "packages/orchestrator-standalone/src/cli.ts"
+      ],
+      "advice": "Set a safe default timeout for queued auto-run jobs and allow explicit override."
+    },
+    {
+      "id": "timeout-regression",
+      "title": "Timeout behavior not covered by tests",
+      "category": "compatibility",
+      "severity": "medium",
+      "regex": "timeout-ms",
+      "fileGlobsHint": [
+        "packages/orchestrator-standalone/src/**/*.test.ts"
+      ],
+      "advice": "Add deterministic tests validating timeout defaults and override behavior."
+    }
+  ],
+  "steps": [
+    {
+      "id": "inventory-timeout-paths",
+      "title": "Inventory timeout paths",
+      "kind": "analyze",
+      "description": "Trace timeout propagation from enqueue/intake through auto-run and DAG execution.",
+      "mutating": false
+    },
+    {
+      "id": "implement-timeout-guard",
+      "title": "Implement timeout guard defaults",
+      "kind": "transform",
+      "description": "Apply safe default timeout for worker-enqueued runs while preserving user override capability.",
+      "mutating": true
+    },
+    {
+      "id": "validate-timeout-flow",
+      "title": "Validate timeout + retry flow",
+      "kind": "verify",
+      "description": "Run targeted tests and smoke the queue flow to ensure timeouts fail predictably without orphaning jobs.",
+      "mutating": false
+    },
+    {
+      "id": "document-timeout-knobs",
+      "title": "Document timeout controls",
+      "kind": "notify",
+      "description": "Update README with timeout defaults and override examples for recipe-intake/worker-enqueue.",
+      "mutating": true
+    }
+  ],
+  "gates": [
+    {
+      "id": "gate-typecheck",
+      "title": "Typecheck passes",
+      "kind": "command",
+      "required": true,
+      "command": "npm --prefix packages/orchestrator-standalone run typecheck"
+    },
+    {
+      "id": "gate-tests",
+      "title": "Worker + DAG tests pass",
+      "kind": "command",
+      "required": true,
+      "command": "npm --prefix packages/orchestrator-standalone run test:run -- src/autonomy/worker.test.ts src/dag/compiler-runner.test.ts"
+    },
+    {
+      "id": "gate-risk-high",
+      "title": "No unresolved high/critical risks",
+      "kind": "risk",
+      "required": true,
+      "note": "Block completion if timeout handling still allows stuck runs without bounded failure behavior."
+    }
+  ],
+  "rollbackHints": [
+    "Allow users to override timeout via --timeout-ms when long-running modules are expected.",
+    "Keep worker state recovery path intact to retry or cancel timed-out runs safely."
+  ],
+  "edgeCases": [
+    "Provider subprocess exits after timeout signal but before artifact write.",
+    "Large modules legitimately need longer timeout and must opt-in override."
+  ]
+}

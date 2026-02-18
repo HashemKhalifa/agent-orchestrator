@@ -1,0 +1,108 @@
+{
+  "id": "backlog-worker-cancel-retry-cli",
+  "version": "1.0.0",
+  "title": "Worker Cancel/Retry CLI Controls",
+  "description": "Add first-class commands to cancel stuck jobs and retry failed/canceled jobs without manual state edits.",
+  "goalType": "custom",
+  "defaultWaveStrategy": "pilot_wave",
+  "preconditions": {
+    "packageManagers": [
+      "npm",
+      "pnpm",
+      "yarn",
+      "unknown"
+    ],
+    "requiresFiles": [
+      "packages/orchestrator-standalone/src/cli.ts",
+      "packages/orchestrator-standalone/src/autonomy/worker.ts"
+    ],
+    "requiresBuildTools": []
+  },
+  "discoverySources": [
+    {
+      "id": "worker-state-machine",
+      "title": "Worker state-machine conventions",
+      "url": "https://martinfowler.com/bliki/StateMachine.html",
+      "type": "curated_secondary",
+      "tags": [
+        "state-machine",
+        "recovery"
+      ]
+    }
+  ],
+  "riskProbes": [
+    {
+      "id": "manual-state-edit-risk",
+      "title": "Manual JSON state edits for recovery",
+      "category": "compatibility",
+      "severity": "high",
+      "regex": "worker-state-path",
+      "fileGlobsHint": [
+        "README.md",
+        "packages/orchestrator-standalone/README.md"
+      ],
+      "advice": "Add supported CLI operations for cancel/retry to avoid corrupting queue state."
+    }
+  ],
+  "steps": [
+    {
+      "id": "define-transitions",
+      "title": "Define safe cancel/retry transitions",
+      "kind": "analyze",
+      "description": "Formalize which statuses can transition to canceled or pending retry.",
+      "mutating": false
+    },
+    {
+      "id": "add-worker-commands",
+      "title": "Implement worker-cancel and worker-retry",
+      "kind": "transform",
+      "description": "Add CLI commands and state mutation helpers for deterministic cancel/retry operations.",
+      "mutating": true
+    },
+    {
+      "id": "add-tests",
+      "title": "Add transition tests",
+      "kind": "verify",
+      "description": "Validate command behavior for pending/running/failed/canceled/completed states.",
+      "mutating": true
+    },
+    {
+      "id": "update-docs",
+      "title": "Document recovery commands",
+      "kind": "notify",
+      "description": "Document operational runbooks for cancel/retry in both READMEs.",
+      "mutating": true
+    }
+  ],
+  "gates": [
+    {
+      "id": "gate-typecheck",
+      "title": "Typecheck passes",
+      "kind": "command",
+      "required": true,
+      "command": "npm --prefix packages/orchestrator-standalone run typecheck"
+    },
+    {
+      "id": "gate-tests",
+      "title": "Worker tests pass",
+      "kind": "command",
+      "required": true,
+      "command": "npm --prefix packages/orchestrator-standalone run test:run -- src/autonomy/worker.test.ts"
+    },
+    {
+      "id": "gate-risk-high",
+      "title": "No unresolved high/critical risks",
+      "kind": "risk",
+      "required": true,
+      "note": "Do not ship if cancel/retry can produce invalid job lifecycle transitions."
+    }
+  ],
+  "rollbackHints": [
+    "Keep worker state schema backward compatible.",
+    "Preserve existing worker-status and worker-run behavior."
+  ],
+  "edgeCases": [
+    "Retry requested for completed job should be blocked by policy.",
+    "Cancel requested for stale running job should record explicit operator reason."
+  ]
+}

@@ -87,6 +87,63 @@ export const ExecutionRecipeSchema = z.object({
   edgeCases: z.array(z.string().trim().min(1)).default([]),
 });
 
+/**
+ * Scaffold contract: output file conventions.
+ *
+ * Generated recipe files MUST live under a `generated/recipes/` directory
+ * relative to the workspace root and use the pattern:
+ *   `generated/recipes/<normalized-recipe-id>.json`
+ *
+ * Minimal required inputs: `workspaceRoot` and `recipeId`.
+ * All other fields are optional enrichment that override heuristic defaults.
+ */
+export const SCAFFOLD_OUTPUT_DIR = "generated/recipes" as const;
+export const SCAFFOLD_OUTPUT_EXT = ".json" as const;
+
+export function scaffoldOutputPath(recipeId: string): string {
+  const normalized = recipeId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+  return `${SCAFFOLD_OUTPUT_DIR}/${normalized || "recipe"}${SCAFFOLD_OUTPUT_EXT}`;
+}
+
+export const ScaffoldRecipeInputSchema = z.object({
+  /** Absolute or relative path to the workspace root. Required. */
+  workspaceRoot: z.string().trim().min(1),
+  /** Human-readable recipe id (will be normalized). Required. */
+  recipeId: z.string().trim().min(1),
+  /** Goal type. Defaults to "custom" when omitted. */
+  goalType: GoalTypeSchema.optional(),
+  /** Override the auto-generated title. */
+  title: z.string().trim().min(1).optional(),
+  /** Override the auto-generated description. */
+  description: z.string().trim().min(1).optional(),
+  /**
+   * Output path relative to workspaceRoot.
+   * Must end with `.json` and live under `generated/recipes/`.
+   * Use `scaffoldOutputPath(recipeId)` to derive the conventional path.
+   */
+  outputPath: z.string().trim().min(1)
+    .refine(
+      (p) => p.endsWith(SCAFFOLD_OUTPUT_EXT),
+      { message: `Output path must end with ${SCAFFOLD_OUTPUT_EXT}` },
+    )
+    .refine(
+      (p) => p.startsWith(SCAFFOLD_OUTPUT_DIR + "/") || p === SCAFFOLD_OUTPUT_DIR,
+      { message: `Output path must be under ${SCAFFOLD_OUTPUT_DIR}/` },
+    )
+    .optional(),
+  overwrite: z.boolean().optional(),
+});
+
+export const ScaffoldRecipeOutputSchema = z.object({
+  recipe: ExecutionRecipeSchema,
+  outputPath: z.string().nullable(),
+  summary: z.string().trim().min(1),
+});
+
 export const OrchestrationGoalSchema = z.object({
   goalType: GoalTypeSchema,
   recipeId: z.string().trim().min(1),
@@ -260,3 +317,5 @@ export type ValidationReport = z.infer<typeof ValidationReportSchema>;
 export type GateResult = z.infer<typeof GateResultSchema>;
 export type ExecutionReport = z.infer<typeof ExecutionReportSchema>;
 export type RunState = z.infer<typeof RunStateSchema>;
+export type ScaffoldRecipeInput = z.infer<typeof ScaffoldRecipeInputSchema>;
+export type ScaffoldRecipeOutput = z.infer<typeof ScaffoldRecipeOutputSchema>;

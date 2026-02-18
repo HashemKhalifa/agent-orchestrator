@@ -139,7 +139,7 @@ export async function runGoldenEvaluation(args?: {
       dependencyMode: "staged",
     });
 
-    const dagRun = runDag({
+    const dagRun = await runDag({
       workspaceRoot: repoRoot,
       manifestPath: "generated/golden/dag/manifest.json",
       executorTemplate: "echo module {id}",

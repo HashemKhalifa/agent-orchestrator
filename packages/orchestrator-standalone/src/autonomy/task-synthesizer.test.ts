@@ -80,4 +80,43 @@ describe("synthesizeTaskRequest", () => {
     const generated = path.relative(root, result.requestPath).replace(/\\/g, "/");
     expect(generated).toBe("generated/autonomy/request.generated.md");
   });
+
+  it("supports auto-refine retrieval evidence mode", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-task-synth-refine-"));
+    cleanup.push(root);
+
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "demo", version: "1.0.0" }), "utf8");
+    writeFileSync(
+      path.join(root, "src", "build.ts"),
+      [
+        "export const migration = 'webpack rsbuild migration plugin compatibility checklist';",
+        "export const risks = 'loader deprecation and bundler migration regressions';",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const ragIndex = buildRagIndex({ workspaceRoot: root, maxFiles: 100 });
+    const ragPath = saveRagIndex({
+      index: ragIndex,
+      outputPath: path.join(root, "generated", "rag", "index.json"),
+    });
+
+    const result = synthesizeTaskRequest({
+      workspaceRoot: root,
+      goalType: "build_migration",
+      recipeId: "webpack-to-rsbuild-incremental",
+      ragIndexPath: ragPath,
+      ragAutoRefine: true,
+      ragRefineMaxIterations: 2,
+      ragRefineMaxQueries: 8,
+      outputPath: "generated/autonomy/request.refined.md",
+      maxTasks: 12,
+    });
+
+    const content = readFileSync(result.requestPath, "utf8");
+    expect(content).toContain("Auto-Refine Retrieval");
+    expect(content).toContain("Replay memory suggestions:");
+    expect(content).toContain("Refined Top Hits");
+  });
 });

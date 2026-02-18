@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { discoverWorkspaceFacts, summarizeWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import { collectInternetEvidence } from "../adapters/internet-evidence.js";
@@ -13,6 +13,8 @@ import {
   type OrchestrationGoal,
   type RecipeStep,
   type RiskProbe,
+  type ScaffoldRecipeInput,
+  type ScaffoldRecipeOutput,
   type SourcePolicy,
   type WorkspaceFacts,
 } from "../spec/schemas.js";
@@ -60,6 +62,35 @@ function dedupeById<T extends { id: string }>(items: T[]): T[] {
 
 function dedupeStrings(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function titleFromRecipeId(recipeId: string): string {
+  const normalized = normalizeId(recipeId);
+  if (!normalized) return "New Recipe";
+  return normalized
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function inferScaffoldPreconditions(args: {
+  workspaceRoot: string;
+  workspaceFacts: WorkspaceFacts;
+}): ExecutionRecipe["preconditions"] {
+  const packageManagers: Array<"npm" | "pnpm" | "yarn" | "unknown"> = args.workspaceFacts.packageManager === "unknown"
+    ? ["npm", "pnpm", "yarn", "unknown"]
+    : [args.workspaceFacts.packageManager];
+
+  const requiresFiles = new Set<string>();
+  if (existsSync(path.join(args.workspaceRoot, "package.json"))) {
+    requiresFiles.add("package.json");
+  }
+
+  return {
+    packageManagers,
+    requiresFiles: Array.from(requiresFiles).sort(),
+    requiresBuildTools: dedupeStrings(args.workspaceFacts.detectedBuildTools).sort(),
+  };
 }
 
 function heuristicsRiskProbes(args: {
@@ -331,5 +362,68 @@ export async function generateRecipeFromContext(args: {
     baseRecipeId: baseRecipe.id,
     memory,
     summary,
+  };
+}
+
+export function scaffoldRecipeTemplate(args: ScaffoldRecipeInput): ScaffoldRecipeOutput {
+  const workspaceRoot = path.resolve(args.workspaceRoot);
+  const goalType = args.goalType ?? "custom";
+  const normalizedId = normalizeId(args.recipeId);
+  if (!normalizedId) {
+    throw new Error("--recipe-id must contain at least one alphanumeric character");
+  }
+
+  if (getRecipeCatalog().some((recipe) => recipe.id === normalizedId)) {
+    throw new Error(`recipe-id '${normalizedId}' already exists in catalog`);
+  }
+
+  const workspaceFacts = discoverWorkspaceFacts(workspaceRoot);
+  const recipe = ExecutionRecipeSchema.parse({
+    id: normalizedId,
+    version: "0.1.0",
+    title: args.title ?? titleFromRecipeId(normalizedId),
+    description:
+      args.description
+      ?? `Scaffolded ${goalType} recipe. Replace placeholders with migration-specific details.`,
+    goalType,
+    defaultWaveStrategy: "pilot_wave",
+    preconditions: inferScaffoldPreconditions({
+      workspaceRoot,
+      workspaceFacts,
+    }),
+    discoverySources: [
+      {
+        id: "scaffold-schema-guide",
+        title: "Schema-Driven Recipe Authoring Guide",
+        url: "https://json-schema.org/learn/getting-started-step-by-step",
+        type: "curated_secondary",
+        tags: ["scaffold", "recipe-authoring"],
+      },
+    ],
+    riskProbes: [],
+    steps: goalTypeDefaultSteps(goalType),
+    gates: DEFAULT_GATES,
+    rollbackHints: ["Capture rollback checkpoints for each mutating wave."],
+    edgeCases: [
+      "User provides recipe id that already exists in catalog.",
+      "Workspace has no package.json and inferred preconditions must fall back safely.",
+    ],
+  });
+
+  let outputPath: string | null = null;
+  if (args.outputPath) {
+    const outputAbs = path.resolve(workspaceRoot, args.outputPath);
+    if (existsSync(outputAbs) && !args.overwrite) {
+      throw new Error(`Refusing to overwrite existing scaffold at '${outputAbs}'. Pass --overwrite to replace it.`);
+    }
+    mkdirSync(path.dirname(outputAbs), { recursive: true });
+    writeFileSync(outputAbs, `${JSON.stringify(recipe, null, 2)}\n`, "utf8");
+    outputPath = outputAbs;
+  }
+
+  return {
+    recipe,
+    outputPath,
+    summary: `Scaffolded recipe '${recipe.id}' (${recipe.goalType}) with ${recipe.steps.length} steps and ${recipe.gates.length} gates.`,
   };
 }

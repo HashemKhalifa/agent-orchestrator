@@ -6,6 +6,7 @@ import { RagIndexSchema, type RagChunk, type RagIndex } from "./types.js";
 const IGNORE_DIRS = new Set([
   ".git",
   "node_modules",
+  "generated",
   "dist",
   "build",
   "coverage",
@@ -45,6 +46,7 @@ function collectFiles(args: {
   workspaceRoot: string;
   maxFiles: number;
   extensions?: Set<string>;
+  includeGenerated?: boolean;
 }): string[] {
   const root = path.resolve(args.workspaceRoot);
   const out: string[] = [];
@@ -72,6 +74,11 @@ function collectFiles(args: {
       }
 
       if (stats.isDirectory()) {
+        if (entry === "generated" && args.includeGenerated) {
+          queue.push(fullPath);
+          continue;
+        }
+
         if (!IGNORE_DIRS.has(entry)) queue.push(fullPath);
         continue;
       }
@@ -162,11 +169,13 @@ export function buildRagIndex(args: {
   maxCharsPerChunk?: number;
   embeddingDims?: number;
   maxTermsPerChunk?: number;
+  includeGenerated?: boolean;
 }): RagIndex {
   const workspaceRoot = path.resolve(args.workspaceRoot);
   const files = collectFiles({
     workspaceRoot,
     maxFiles: args.maxFiles ?? 3000,
+    includeGenerated: args.includeGenerated ?? false,
   });
 
   const embeddingDims = Math.max(8, args.embeddingDims ?? 96);

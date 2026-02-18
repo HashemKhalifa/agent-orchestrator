@@ -243,6 +243,7 @@ export async function compileRequestDag(args: {
       mode: inferMode(kind),
       level: 0,
       dependsOn: [],
+      resources: [],
       kind,
     };
   });
