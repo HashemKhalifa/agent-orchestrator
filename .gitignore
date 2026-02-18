@@ -3,4 +3,5 @@ node_modules/
 **/dist/
 .generated/
 generated/
+.omc/
 .DS_Store
