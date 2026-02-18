@@ -1,0 +1,364 @@
+name: Orchestration Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run mode
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - dry-run
+          - apply
+      goal_type:
+        description: Goal type
+        required: true
+        default: custom
+        type: string
+      recipe_id:
+        description: Recipe id
+        required: true
+        default: ci-node-build-test-modernization
+        type: string
+      workspace_root:
+        description: Workspace root path
+        required: true
+        default: .
+        type: string
+      max_iterations:
+        description: Max autonomous iterations
+        required: true
+        default: "3"
+        type: string
+      policy_packs:
+        description: Comma-separated policy pack ids (security,legal,release,infra)
+        required: false
+        default: ""
+        type: string
+      canary_modules:
+        description: Canary checkpoint after N successful modules
+        required: false
+        default: "0"
+        type: string
+      executor_template:
+        description: Executor template for DAG modules
+        required: false
+        default: echo module {id}
+        type: string
+      evidence_sha256:
+        description: Optional expected SHA256 for generated apply evidence file
+        required: false
+        default: ""
+        type: string
+      benchmark_max_quality_drop:
+        description: Optional benchmark gate threshold for quality-score drop
+        required: false
+        default: ""
+        type: string
+      benchmark_max_time_increase_ms:
+        description: Optional benchmark gate threshold for avg time increase
+        required: false
+        default: ""
+        type: string
+      benchmark_max_cost_increase_tokens:
+        description: Optional benchmark gate threshold for avg token-cost increase
+        required: false
+        default: ""
+        type: string
+      benchmark_max_failure_rate_increase:
+        description: Optional benchmark gate threshold for failure-rate increase
+        required: false
+        default: ""
+        type: string
+      benchmark_max_pass_rate_drop:
+        description: Optional benchmark gate threshold for pass-rate drop
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: orchestration-${{ github.ref_name }}-${{ github.event.inputs.mode || 'plan' }}-${{ github.event.inputs.recipe_id || 'recipe' }}
+  cancel-in-progress: false
+
+jobs:
+  plan_or_dry_run:
+    if: ${{ inputs.mode != 'apply' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: packages/orchestrator-standalone/package-lock.json
+
+      - name: Install dependencies
+        run: npm --prefix packages/orchestrator-standalone install
+
+      - name: Run benchmark trend gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated/orchestration/ci
+          BENCH_CMD=(
+            npm --prefix packages/orchestrator-standalone run cli -- eval-benchmark
+            --workspace-root "${{ inputs.workspace_root }}"
+            --benchmark-history-path generated/orchestration/benchmark/history.json
+            --benchmark-commit "${GITHUB_SHA}"
+            --json-out generated/orchestration/ci/benchmark-summary.json
+          )
+
+          if [[ -n "${{ inputs.benchmark_max_quality_drop }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-quality-drop "${{ inputs.benchmark_max_quality_drop }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_time_increase_ms }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-time-increase-ms "${{ inputs.benchmark_max_time_increase_ms }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_cost_increase_tokens }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-cost-increase-tokens "${{ inputs.benchmark_max_cost_increase_tokens }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_failure_rate_increase }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-failure-rate-increase "${{ inputs.benchmark_max_failure_rate_increase }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_pass_rate_drop }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-pass-rate-drop "${{ inputs.benchmark_max_pass_rate_drop }}")
+          fi
+
+          "${BENCH_CMD[@]}"
+
+      - name: Run orchestrator
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}"
+          JSON_OUT="generated/orchestration/ci/${MODE}-summary.json"
+          mkdir -p generated/orchestration/ci
+
+          CMD=(
+            npm --prefix packages/orchestrator-standalone run cli -- auto-run
+            --goal-type "${{ inputs.goal_type }}"
+            --recipe-id "${{ inputs.recipe_id }}"
+            --workspace-root "${{ inputs.workspace_root }}"
+            --apply-mode dry-run
+            --executor-profile none
+            --executor "${{ inputs.executor_template }}"
+            --max-total-attempts 250
+            --max-total-tokens 200000
+            --max-run-runtime-ms 1800000
+            --enable-critic
+            --enable-repair-loop
+            --test-impact targeted
+            --canary-modules "${{ inputs.canary_modules }}"
+            --json-out "$JSON_OUT"
+          )
+
+          if [[ "$MODE" == "plan" ]]; then
+            CMD+=(--dry-run)
+          fi
+
+          if [[ -n "${{ inputs.policy_packs }}" ]]; then
+            IFS=',' read -ra PACKS <<< "${{ inputs.policy_packs }}"
+            for pack in "${PACKS[@]}"; do
+              trimmed="$(echo "$pack" | xargs)"
+              if [[ -n "$trimmed" ]]; then
+                CMD+=(--policy-pack "$trimmed")
+              fi
+            done
+          fi
+
+          "${CMD[@]}"
+
+      - name: Upload orchestration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestration-${{ inputs.mode }}
+          path: generated/orchestration
+          if-no-files-found: error
+          retention-days: 14
+
+  apply:
+    if: ${{ inputs.mode == 'apply' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: orchestration-apply
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: packages/orchestrator-standalone/package-lock.json
+
+      - name: Install dependencies
+        run: npm --prefix packages/orchestrator-standalone install
+
+      - name: Run benchmark trend gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated/orchestration/ci
+          BENCH_CMD=(
+            npm --prefix packages/orchestrator-standalone run cli -- eval-benchmark
+            --workspace-root "${{ inputs.workspace_root }}"
+            --benchmark-history-path generated/orchestration/benchmark/history.json
+            --benchmark-commit "${GITHUB_SHA}"
+            --json-out generated/orchestration/ci/benchmark-summary.json
+          )
+
+          if [[ -n "${{ inputs.benchmark_max_quality_drop }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-quality-drop "${{ inputs.benchmark_max_quality_drop }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_time_increase_ms }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-time-increase-ms "${{ inputs.benchmark_max_time_increase_ms }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_cost_increase_tokens }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-cost-increase-tokens "${{ inputs.benchmark_max_cost_increase_tokens }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_failure_rate_increase }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-failure-rate-increase "${{ inputs.benchmark_max_failure_rate_increase }}")
+          fi
+          if [[ -n "${{ inputs.benchmark_max_pass_rate_drop }}" ]]; then
+            BENCH_CMD+=(--benchmark-max-pass-rate-drop "${{ inputs.benchmark_max_pass_rate_drop }}")
+          fi
+
+          "${BENCH_CMD[@]}"
+
+      - name: Validate apply actor allowlist
+        shell: bash
+        env:
+          APPLY_ACTOR_ALLOWLIST: ${{ secrets.ORCHESTRATION_APPLY_ACTORS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLY_ACTOR_ALLOWLIST:-}" ]]; then
+            echo "No ORCHESTRATION_APPLY_ACTORS allowlist configured; skipping actor restriction."
+            exit 0
+          fi
+
+          IFS=',' read -ra ACTORS <<< "$APPLY_ACTOR_ALLOWLIST"
+          ALLOWED=0
+          for actor in "${ACTORS[@]}"; do
+            trimmed="$(echo "$actor" | xargs)"
+            if [[ "$trimmed" == "${GITHUB_ACTOR}" ]]; then
+              ALLOWED=1
+              break
+            fi
+          done
+
+          if [[ "$ALLOWED" -ne 1 ]]; then
+            echo "Actor '${GITHUB_ACTOR}' is not allowed to run apply mode." >&2
+            exit 1
+          fi
+
+      - name: Require security and release policy packs for apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKS="${{ inputs.policy_packs }}"
+          normalized="$(echo "$PACKS" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+          if [[ "$normalized" != *security* || "$normalized" != *release* ]]; then
+            echo "Apply mode requires policy_packs to include both security and release." >&2
+            exit 1
+          fi
+
+      - name: Prepare apply evidence and approvals
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated/orchestration/evidence
+          mkdir -p generated/orchestration/approvals
+          cat > generated/orchestration/evidence/apply-evidence.md <<MARKDOWN
+          # Apply Evidence
+
+          - Generated by GitHub Actions orchestration apply workflow.
+          - Manual approval for this run is enforced through environment protection.
+          - Actor: ${GITHUB_ACTOR}
+          - Ref: ${GITHUB_REF}
+          - Run URL: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          MARKDOWN
+          cat > generated/orchestration/approvals/wave-1.approved.json <<'JSON'
+          {"approved": true}
+          JSON
+
+      - name: Verify apply evidence checksum (optional)
+        if: ${{ inputs.evidence_sha256 != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum generated/orchestration/evidence/apply-evidence.md | awk '{print $1}')"
+          expected="${{ inputs.evidence_sha256 }}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Evidence checksum mismatch: expected $expected got $actual" >&2
+            exit 1
+          fi
+
+      - name: Run orchestrator apply
+        shell: bash
+        env:
+          APPLY_GUARD_TOKEN: ${{ secrets.ORCHESTRATION_APPLY_GUARD_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLY_GUARD_TOKEN:-}" ]]; then
+            echo "Missing secret ORCHESTRATION_APPLY_GUARD_TOKEN" >&2
+            exit 1
+          fi
+
+          JSON_OUT="generated/orchestration/ci/apply-summary.json"
+          mkdir -p generated/orchestration/ci
+
+          CMD=(
+            npm --prefix packages/orchestrator-standalone run cli -- auto-run
+            --goal-type "${{ inputs.goal_type }}"
+            --recipe-id "${{ inputs.recipe_id }}"
+            --workspace-root "${{ inputs.workspace_root }}"
+            --apply-mode apply
+            --apply-guard-token "$APPLY_GUARD_TOKEN"
+            --executor-profile none
+            --executor "${{ inputs.executor_template }}"
+            --max-total-attempts 250
+            --max-total-tokens 200000
+            --max-run-runtime-ms 1800000
+            --enable-critic
+            --enable-repair-loop
+            --test-impact targeted_then_full
+            --canary-modules "${{ inputs.canary_modules }}"
+            --json-out "$JSON_OUT"
+          )
+
+          if [[ -n "${{ inputs.policy_packs }}" ]]; then
+            IFS=',' read -ra PACKS <<< "${{ inputs.policy_packs }}"
+            for pack in "${PACKS[@]}"; do
+              trimmed="$(echo "$pack" | xargs)"
+              if [[ -n "$trimmed" ]]; then
+                CMD+=(--policy-pack "$trimmed")
+              fi
+            done
+          fi
+
+          "${CMD[@]}"
+
+      - name: Generate artifact checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find generated/orchestration -type f -print0 | sort -z | xargs -0 sha256sum > generated/orchestration/SHA256SUMS.txt
+
+      - name: Upload orchestration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestration-apply
+          path: generated/orchestration
+          if-no-files-found: error
+          retention-days: 30
