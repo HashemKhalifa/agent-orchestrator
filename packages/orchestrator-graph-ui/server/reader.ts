@@ -21,6 +21,7 @@ interface IterationSummaryInput {
     startedAt?: string;
     completedAt?: string;
     status?: string;
+    resumedModules?: number;
     repairsGenerated?: number;
     policyPacks?: unknown[];
     results?: Array<{
@@ -35,6 +36,28 @@ interface IterationSummaryInput {
       totalTokensEstimated?: number;
       totalTokensObserved?: number;
       elapsedMs?: number;
+    };
+    memoryRevisit?: {
+      totalCalls?: number;
+      hitsUsed?: number;
+      candidatesLoadedBySource?: {
+        semanticMemory?: number;
+        replayMemory?: number;
+        artifactContract?: number;
+      };
+      selectedBySource?: {
+        semanticMemory?: number;
+        replayMemory?: number;
+        artifactContract?: number;
+      };
+      skippedByReason?: {
+        disabled?: number;
+        maxCallsPerModule?: number;
+        emptyQuery?: number;
+        noCandidates?: number;
+        negativeMemoryBlocked?: number;
+        belowThreshold?: number;
+      };
     };
   };
 }
@@ -65,8 +88,20 @@ export interface RunTelemetry {
   totalTokensEffective: number | null;
   totalTokensEstimated: number | null;
   totalTokensObserved: number | null;
+  resumedModules: number;
   repairsGenerated: number;
   policyPackCount: number;
+  memoryCalls: number;
+  memoryHits: number;
+  memoryCandidatesLoaded: number;
+  memoryCandidatesSemantic: number;
+  memoryCandidatesReplay: number;
+  memoryCandidatesArtifact: number;
+  memorySelectedSemantic: number;
+  memorySelectedReplay: number;
+  memorySelectedArtifact: number;
+  memorySkippedTotal: number;
+  memorySkippedPreview: string | null;
   generatedAt: string | null;
 }
 
@@ -377,6 +412,28 @@ function buildTelemetry(
     : Array.isArray(iterationSummary?.recipe?.policyPacks)
       ? iterationSummary!.recipe!.policyPacks!.length
       : 0;
+  const memory = iterationSummary?.dagSummary?.memoryRevisit;
+  const memoryCandidatesSemantic = numberOrNull(memory?.candidatesLoadedBySource?.semanticMemory) ?? 0;
+  const memoryCandidatesReplay = numberOrNull(memory?.candidatesLoadedBySource?.replayMemory) ?? 0;
+  const memoryCandidatesArtifact = numberOrNull(memory?.candidatesLoadedBySource?.artifactContract) ?? 0;
+  const memorySelectedSemantic = numberOrNull(memory?.selectedBySource?.semanticMemory) ?? 0;
+  const memorySelectedReplay = numberOrNull(memory?.selectedBySource?.replayMemory) ?? 0;
+  const memorySelectedArtifact = numberOrNull(memory?.selectedBySource?.artifactContract) ?? 0;
+  const skippedReasons = memory?.skippedByReason;
+  const skippedTokens = skippedReasons
+    ? Object.entries(skippedReasons)
+      .map(([key, value]) => [key, numberOrNull(value) ?? 0] as const)
+      .filter(([, value]) => value > 0)
+      .map(([key, value]) => `${key}:${value}`)
+    : [];
+  const memorySkippedTotal = skippedReasons
+    ? (numberOrNull(skippedReasons.disabled) ?? 0) +
+      (numberOrNull(skippedReasons.maxCallsPerModule) ?? 0) +
+      (numberOrNull(skippedReasons.emptyQuery) ?? 0) +
+      (numberOrNull(skippedReasons.noCandidates) ?? 0) +
+      (numberOrNull(skippedReasons.negativeMemoryBlocked) ?? 0) +
+      (numberOrNull(skippedReasons.belowThreshold) ?? 0)
+    : 0;
 
   return {
     totalModules: results.length,
@@ -388,8 +445,20 @@ function buildTelemetry(
     totalTokensEffective: numberOrNull(iterationSummary?.dagSummary?.budget?.totalTokensEffective),
     totalTokensEstimated: numberOrNull(iterationSummary?.dagSummary?.budget?.totalTokensEstimated),
     totalTokensObserved: numberOrNull(iterationSummary?.dagSummary?.budget?.totalTokensObserved),
+    resumedModules: numberOrNull(iterationSummary?.dagSummary?.resumedModules) ?? 0,
     repairsGenerated: numberOrNull(iterationSummary?.dagSummary?.repairsGenerated) ?? 0,
     policyPackCount,
+    memoryCalls: numberOrNull(memory?.totalCalls) ?? 0,
+    memoryHits: numberOrNull(memory?.hitsUsed) ?? 0,
+    memoryCandidatesLoaded: memoryCandidatesSemantic + memoryCandidatesReplay + memoryCandidatesArtifact,
+    memoryCandidatesSemantic,
+    memoryCandidatesReplay,
+    memoryCandidatesArtifact,
+    memorySelectedSemantic,
+    memorySelectedReplay,
+    memorySelectedArtifact,
+    memorySkippedTotal,
+    memorySkippedPreview: skippedTokens.length > 0 ? skippedTokens.join(", ") : null,
     generatedAt: typeof iterationSummary?.generatedAt === "string" ? iterationSummary.generatedAt : null,
   };
 }

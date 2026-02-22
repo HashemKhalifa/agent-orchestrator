@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { discoverWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import type { WorkspaceFacts } from "../spec/schemas.js";
 import {
@@ -14,7 +14,9 @@ import {
   type DagCriticSeverity,
   type DagCommandTrace,
   type DagDiffFile,
+  type DagModuleArtifact,
   type DagManifest,
+  type DagMemoryRevisitHit,
   type DagRunResult,
   type DagRunSummary,
 } from "./types.js";
@@ -33,6 +35,7 @@ import {
   type PolicyCriticParser,
   type ResolvedPolicyCriticRule,
 } from "../policy/critic.js";
+import { readSemanticState } from "../autonomy/semantic-memory.js";
 
 const SNAPSHOT_IGNORES = new Set([
   ".git",
@@ -40,10 +43,16 @@ const SNAPSHOT_IGNORES = new Set([
   "dist",
   "build",
   "coverage",
+  ".jest-cache",
   ".next",
+  ".nx",
   ".turbo",
   ".cache",
+  ".omc",
 ]);
+const CHANGED_FILES_CONTEXT_LIMIT = 400;
+const CHANGED_FILES_ARTIFACT_LIMIT = 2000;
+const DEFAULT_ANALYZE_TIMEOUT_MS = 45_000;
 
 interface CommandCheckResult {
   passed: boolean;
@@ -85,6 +94,73 @@ interface TestImpactResult {
   traces: DagCommandTrace[];
   commands: string[];
   detail: string;
+  fullSuiteRan: boolean;
+}
+
+type MemoryRevisitSource = DagMemoryRevisitHit["source"];
+type MemoryRevisitSkipReason =
+  | "disabled"
+  | "max_calls_per_module"
+  | "empty_query"
+  | "no_candidates"
+  | "negative_memory_blocked"
+  | "below_threshold";
+
+interface MemoryRevisitSourceCounters {
+  semanticMemory: number;
+  replayMemory: number;
+  artifactContract: number;
+}
+
+interface MemoryRevisitSkipCounters {
+  disabled: number;
+  maxCallsPerModule: number;
+  emptyQuery: number;
+  noCandidates: number;
+  negativeMemoryBlocked: number;
+  belowThreshold: number;
+}
+
+interface MemoryRevisitConfig {
+  enabled: boolean;
+  recipeId: string | null;
+  autonomyDir: string;
+  semanticMemoryPath?: string;
+  replayMemoryPath?: string;
+  maxCallsPerModule: number;
+  topK: number;
+  minScore: number;
+  maxArtifactCandidates: number;
+}
+
+interface MemoryRevisitState {
+  totalCalls: number;
+  hitsUsed: number;
+  callsByModule: Map<string, number>;
+  candidatesLoadedBySource: MemoryRevisitSourceCounters;
+  selectedBySource: MemoryRevisitSourceCounters;
+  skippedByReason: MemoryRevisitSkipCounters;
+}
+
+interface MemoryRevisitCandidate {
+  source: MemoryRevisitSource;
+  summary: string;
+  reference: string | null;
+  tokens: Set<string>;
+  baseScore: number;
+  timestampMs: number;
+  acceptedMitigation: boolean;
+  failureFrequency: number;
+  negativeMitigation: boolean;
+}
+
+interface ResumeArtifactEntry {
+  moduleId: string;
+  inputDigest: string | null;
+  attempt: number;
+  generatedAtMs: number;
+  artifactPathRel: string;
+  artifact: DagModuleArtifact;
 }
 
 function loadManifest(manifestPath: string): DagManifest {
@@ -156,19 +232,36 @@ async function runCommandCheck(command: string, cwd: string, timeoutMs: number):
     let stderrOverflow = false;
     let timedOut = false;
     let settled = false;
+    let timeoutFinalizeTimer: NodeJS.Timeout | null = null;
 
     const finish = (payload: CommandCheckResult) => {
       if (settled) return;
       settled = true;
+      if (timeoutFinalizeTimer) clearTimeout(timeoutFinalizeTimer);
       resolve(payload);
     };
 
+    const supportsProcessGroups = process.platform !== "win32";
     const child = spawn(command, {
       cwd,
       shell: true,
       env: process.env,
+      detached: supportsProcessGroups,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    const killChildTree = (signal: NodeJS.Signals) => {
+      if (child.pid == null) return;
+      try {
+        if (supportsProcessGroups) {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      } catch {
+        // Process may already be gone.
+      }
+    };
 
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
@@ -197,13 +290,41 @@ async function runCommandCheck(command: string, cwd: string, timeoutMs: number):
       stderrOverflow = true;
     });
 
+    let forceKillTimer: NodeJS.Timeout | null = null;
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      killChildTree("SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        killChildTree("SIGKILL");
+      }, 1000);
+      timeoutFinalizeTimer = setTimeout(() => {
+        try {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        } catch {
+          // ignore stream close errors
+        }
+        const overflowSuffix = [
+          stdoutOverflow ? "stdout truncated" : "",
+          stderrOverflow ? "stderr truncated" : "",
+        ]
+          .filter((line) => line.length > 0)
+          .join("; ");
+        const timeoutSuffix = `command timed out after ${timeoutMs}ms`;
+        const stderrParts = [stderr, timeoutSuffix, overflowSuffix].filter((part) => part.length > 0);
+        finish({
+          passed: false,
+          code: 124,
+          stdout,
+          stderr: stderrParts.join("\n"),
+          durationMs: Math.max(0, Date.now() - startedAt),
+        });
+      }, 1500);
     }, timeoutMs);
 
     child.on("error", (error) => {
       clearTimeout(timeout);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       finish({
         passed: false,
         code: null,
@@ -215,6 +336,7 @@ async function runCommandCheck(command: string, cwd: string, timeoutMs: number):
 
     child.on("close", (code) => {
       clearTimeout(timeout);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       const statusCode = timedOut ? 124 : typeof code === "number" ? code : null;
       const overflowSuffix = [
         stdoutOverflow ? "stdout truncated" : "",
@@ -245,6 +367,59 @@ function toCommandTrace(command: string, result: CommandCheckResult): DagCommand
     stdout: result.stdout,
     stderr: result.stderr,
   };
+}
+
+function maybeInjectProviderTimeout(command: string, timeoutMs: number): string {
+  if (!command.includes("timeboxed.sh")) return command;
+  if (/ORCHESTRATOR_PROVIDER_TIMEOUT_MS=\d+/i.test(command)) return command;
+  return `ORCHESTRATOR_PROVIDER_TIMEOUT_MS=${Math.max(1000, Math.trunc(timeoutMs))} ${command}`;
+}
+
+function computeRetryTimeoutBudgetMs(currentTimeoutMs: number, baseTimeoutMs: number): number {
+  const floorStep = 90_000;
+  const candidate = currentTimeoutMs + floorStep;
+  const cap = Math.max(180_000, baseTimeoutMs + 240_000);
+  return Math.max(currentTimeoutMs, Math.min(candidate, cap));
+}
+
+const AUTONOMY_REFUSAL_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /\bwhat would you like to do\b/i, label: "asks for user direction" },
+  { pattern: /\bwould you like me to\b/i, label: "asks for user confirmation" },
+  { pattern: /\bi need to pause\b/i, label: "explicit pause request" },
+  { pattern: /\bbefore I (?:can|do)\b/i, label: "preconditioned on user response" },
+  { pattern: /\bi (?:can'?t|cannot) proceed\b/i, label: "cannot proceed statement" },
+  { pattern: /\bneed (?:your|human) (?:approval|confirmation)\b/i, label: "requires approval text" },
+];
+
+function detectAutonomyRefusal(text: string): string | null {
+  if (!text.trim()) return null;
+  for (const rule of AUTONOMY_REFUSAL_PATTERNS) {
+    if (rule.pattern.test(text)) return rule.label;
+  }
+  return null;
+}
+
+function parseModuleStatusMarker(text: string): "success" | "failed" | null {
+  if (!text.trim()) return null;
+  const strictLinePattern = /^\s*MODULE_STATUS:\s*(success|failed)\s*$/gim;
+  let match: RegExpExecArray | null;
+  let last: "success" | "failed" | null = null;
+  while ((match = strictLinePattern.exec(text)) !== null) {
+    const value = String(match[1] ?? "").toLowerCase();
+    if (value === "success" || value === "failed") {
+      last = value;
+    }
+  }
+  if (last) return last;
+
+  const keyValuePattern = /\bmodule_status\s*[:=]\s*(success|failed)\b/gi;
+  while ((match = keyValuePattern.exec(text)) !== null) {
+    const value = String(match[1] ?? "").toLowerCase();
+    if (value === "success" || value === "failed") {
+      last = value;
+    }
+  }
+  return last;
 }
 
 function estimateTokens(value: string): number {
@@ -363,6 +538,180 @@ function normalizePathForOutput(value: string): string {
   return value.replace(/\\/g, "/");
 }
 
+function clampNonNegativeNumber(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, value);
+}
+
+function clampAtLeastInt(value: number | undefined, fallback: number, min: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.trunc(value));
+}
+
+function tokenizeForRecall(input: string): Set<string> {
+  const matches = input.toLowerCase().match(/[a-z0-9][a-z0-9._/-]{1,}/g) ?? [];
+  return new Set(matches);
+}
+
+function overlapScore(queryTokens: Set<string>, candidateTokens: Set<string>): number {
+  if (queryTokens.size === 0 || candidateTokens.size === 0) return 0;
+  let overlap = 0;
+  for (const token of queryTokens) {
+    if (candidateTokens.has(token)) overlap += 1;
+  }
+  return overlap === 0 ? 0 : overlap / queryTokens.size;
+}
+
+function toScore(value: number, precision = 4): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  const scale = 10 ** precision;
+  return Math.round(value * scale) / scale;
+}
+
+function parseTimeMs(value: string | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sha256(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+function sha256File(filePathAbs: string): string {
+  try {
+    return createHash("sha256").update(readFileSync(filePathAbs)).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
+function computeModuleInputDigest(args: {
+  module: DagManifest["modules"][number];
+  partFileAbs: string;
+  requestDigest: string;
+  applyMode: ApplyMode;
+  policyPacks: string[];
+  resolvedCommand: string;
+}): string {
+  const payload = [
+    `id=${args.module.id}`,
+    `title=${args.module.title}`,
+    `mode=${args.module.mode}`,
+    `partPath=${normalizePathForOutput(args.module.partPath)}`,
+    `partDigest=${sha256File(args.partFileAbs)}`,
+    `requestDigest=${args.requestDigest}`,
+    `applyMode=${args.applyMode}`,
+    `policyPacks=${args.policyPacks.slice().sort().join(",")}`,
+    `resolvedCommand=${args.resolvedCommand}`,
+  ].join("\n");
+  return sha256(payload);
+}
+
+function loadLatestSuccessfulArtifacts(args: {
+  workspaceRoot: string;
+  artifactsDirRel: string;
+}): Map<string, ResumeArtifactEntry> {
+  const out = new Map<string, ResumeArtifactEntry>();
+  const artifactsAbs = path.resolve(args.workspaceRoot, args.artifactsDirRel);
+  if (!existsSync(artifactsAbs)) return out;
+
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(artifactsAbs);
+  } catch {
+    return out;
+  }
+
+  for (const entry of entries) {
+    if (!entry.endsWith(".artifact.json")) continue;
+    const artifactAbs = path.resolve(artifactsAbs, entry);
+    let parsed: DagModuleArtifact | null = null;
+    try {
+      parsed = DagModuleArtifactSchema.parse(JSON.parse(readFileSync(artifactAbs, "utf8")));
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || parsed.status !== "success") continue;
+
+    const nextGeneratedAtMs = parseTimeMs(parsed.generatedAt);
+    const current = out.get(parsed.moduleId);
+    if (current && current.generatedAtMs >= nextGeneratedAtMs) continue;
+
+    out.set(parsed.moduleId, {
+      moduleId: parsed.moduleId,
+      inputDigest: parsed.inputDigest,
+      attempt: parsed.attempt,
+      generatedAtMs: nextGeneratedAtMs,
+      artifactPathRel: normalizePathForOutput(path.relative(args.workspaceRoot, artifactAbs)),
+      artifact: parsed,
+    });
+  }
+
+  return out;
+}
+
+function emptySourceCounters(): MemoryRevisitSourceCounters {
+  return {
+    semanticMemory: 0,
+    replayMemory: 0,
+    artifactContract: 0,
+  };
+}
+
+function emptySkipCounters(): MemoryRevisitSkipCounters {
+  return {
+    disabled: 0,
+    maxCallsPerModule: 0,
+    emptyQuery: 0,
+    noCandidates: 0,
+    negativeMemoryBlocked: 0,
+    belowThreshold: 0,
+  };
+}
+
+function sourceKey(source: MemoryRevisitSource): keyof MemoryRevisitSourceCounters {
+  if (source === "semantic-memory") return "semanticMemory";
+  if (source === "replay-memory") return "replayMemory";
+  return "artifactContract";
+}
+
+function incrementSourceCounter(counters: MemoryRevisitSourceCounters, source: MemoryRevisitSource, by = 1): void {
+  const key = sourceKey(source);
+  counters[key] += Math.max(0, by);
+}
+
+function incrementSkipCounter(state: MemoryRevisitState, reason: MemoryRevisitSkipReason, by = 1): void {
+  const amount = Math.max(0, by);
+  if (reason === "disabled") state.skippedByReason.disabled += amount;
+  else if (reason === "max_calls_per_module") state.skippedByReason.maxCallsPerModule += amount;
+  else if (reason === "empty_query") state.skippedByReason.emptyQuery += amount;
+  else if (reason === "no_candidates") state.skippedByReason.noCandidates += amount;
+  else if (reason === "negative_memory_blocked") state.skippedByReason.negativeMemoryBlocked += amount;
+  else if (reason === "below_threshold") state.skippedByReason.belowThreshold += amount;
+}
+
+function recencyScore(timestampMs: number, nowMs: number): number {
+  if (!Number.isFinite(timestampMs) || timestampMs <= 0) return 0.35;
+  const ageMs = Math.max(0, nowMs - timestampMs);
+  const ageDays = ageMs / (24 * 60 * 60 * 1000);
+  return Math.exp(-ageDays / 45);
+}
+
+function trimText(value: string, maxChars: number): string {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function toRelativeOrAbsolute(workspaceRoot: string, filePath: string): string {
+  const rel = normalizePathForOutput(path.relative(workspaceRoot, filePath));
+  if (!rel || rel.startsWith("..")) {
+    return normalizePathForOutput(filePath);
+  }
+  return rel;
+}
+
 function normalizeModuleResources(module: DagManifest["modules"][number]): string[] {
   const resources = Array.isArray(module.resources) ? module.resources : [];
   const out: string[] = [];
@@ -397,7 +746,74 @@ function shouldIgnoreDirName(name: string): boolean {
   return SNAPSHOT_IGNORES.has(name);
 }
 
-function shouldIgnoreRelativePath(args: { relativePath: string; artifactsDirRel: string; repairsDirRel: string }): boolean {
+function resolveGitRepoRoot(workspaceRoot: string): string | null {
+  try {
+    const repoRoot = execFileSync(
+      "git",
+      ["-C", workspaceRoot, "rev-parse", "--show-toplevel"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return repoRoot ? path.resolve(repoRoot) : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadGitIgnoredPrefixes(args: {
+  workspaceRoot: string;
+  gitRepoRoot: string | null;
+}): string[] {
+  try {
+    if (!args.gitRepoRoot) return [];
+
+    const output = execFileSync(
+      "git",
+      ["-C", args.workspaceRoot, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const repoRootAbs = path.resolve(args.gitRepoRoot);
+    const workspaceRootAbs = path.resolve(args.workspaceRoot);
+    const prefixes = new Set<string>();
+
+    for (const rawLine of output.split(/\r?\n/)) {
+      const line = normalizePathForOutput(rawLine.trim()).replace(/\/$/, "");
+      if (!line) continue;
+      const candidateAbsPaths = [path.resolve(workspaceRootAbs, line), path.resolve(repoRootAbs, line)];
+      for (const candidateAbs of candidateAbsPaths) {
+        const rel = normalizePathForOutput(path.relative(workspaceRootAbs, candidateAbs)).replace(/\/$/, "");
+        if (!rel || rel === "." || rel.startsWith("..")) continue;
+        prefixes.add(rel);
+      }
+    }
+
+    return Array.from(prefixes).sort();
+  } catch {
+    return [];
+  }
+}
+
+function isGitIgnoredPath(relativePath: string, prefixes: string[]): boolean {
+  if (prefixes.length === 0) return false;
+  return prefixes.some((prefix) => relativePath === prefix || relativePath.startsWith(`${prefix}/`));
+}
+
+function mergeGitIgnoredPrefixes(base: string[], next: string[]): string[] {
+  if (next.length === 0) return base;
+  if (base.length === 0) return Array.from(new Set(next)).sort();
+  const out = new Set<string>(base);
+  for (const prefix of next) {
+    if (!prefix) continue;
+    out.add(prefix);
+  }
+  return Array.from(out).sort();
+}
+
+function shouldIgnoreRelativePath(args: {
+  relativePath: string;
+  artifactsDirRel: string;
+  repairsDirRel: string;
+  gitIgnoredPrefixes: string[];
+}): boolean {
   const rel = normalizePathForOutput(args.relativePath);
   if (!rel || rel === ".") return false;
 
@@ -406,13 +822,18 @@ function shouldIgnoreRelativePath(args: { relativePath: string; artifactsDirRel:
     normalizePathForOutput(args.repairsDirRel).replace(/\/$/, ""),
   ];
 
-  return ignoredPrefixes.some((prefix) => prefix && (rel === prefix || rel.startsWith(`${prefix}/`)));
+  if (ignoredPrefixes.some((prefix) => prefix && (rel === prefix || rel.startsWith(`${prefix}/`)))) {
+    return true;
+  }
+
+  return isGitIgnoredPath(rel, args.gitIgnoredPrefixes);
 }
 
 function snapshotWorkspace(args: {
   workspaceRoot: string;
   artifactsDirRel: string;
   repairsDirRel: string;
+  gitIgnoredPrefixes: string[];
   maxFiles?: number;
 }): Map<string, string> {
   const out = new Map<string, string>();
@@ -443,6 +864,7 @@ function snapshotWorkspace(args: {
         relativePath,
         artifactsDirRel: args.artifactsDirRel,
         repairsDirRel: args.repairsDirRel,
+        gitIgnoredPrefixes: args.gitIgnoredPrefixes,
       })) {
         continue;
       }
@@ -486,6 +908,501 @@ function diffSnapshots(before: Map<string, string>, after: Map<string, string>):
   }
 
   return changes;
+}
+
+function loadReplayMemoryEntries(args: { workspaceRoot: string; replayPathAbs: string }): MemoryRevisitCandidate[] {
+  const out: MemoryRevisitCandidate[] = [];
+
+  if (existsSync(args.replayPathAbs)) {
+    try {
+      const parsed = JSON.parse(readFileSync(args.replayPathAbs, "utf8")) as {
+        entries?: Array<{
+          recommendedQueries?: string[];
+          seedQueries?: string[];
+          topHitPaths?: string[];
+          score?: number;
+          successCount?: number;
+          updatedAt?: string;
+        }>;
+      };
+
+      for (const entry of parsed.entries ?? []) {
+        const recommended = (entry.recommendedQueries ?? []).slice(0, 4);
+        const seedQueries = (entry.seedQueries ?? []).slice(0, 3);
+        const topHitPaths = (entry.topHitPaths ?? []).slice(0, 3);
+        if (recommended.length === 0 && seedQueries.length === 0 && topHitPaths.length === 0) {
+          continue;
+        }
+
+        const summaryParts: string[] = [];
+        if (recommended.length > 0) {
+          summaryParts.push(`Recommended retrieval queries: ${recommended.join(" | ")}`);
+        }
+        if (seedQueries.length > 0) {
+          summaryParts.push(`Seed context: ${seedQueries.join(" | ")}`);
+        }
+        if (topHitPaths.length > 0) {
+          summaryParts.push(`Top prior hits: ${topHitPaths.join(", ")}`);
+        }
+        const summary = trimText(summaryParts.join(". "), 420);
+        const tokens = tokenizeForRecall(`${summary} ${recommended.join(" ")} ${seedQueries.join(" ")}`);
+        if (tokens.size === 0) continue;
+
+        const score = clampNonNegativeNumber(entry.score, 0);
+        const successCount = clampAtLeastInt(entry.successCount, 1, 1);
+        const baseScore = Math.min(1, score + Math.min(0.35, successCount * 0.05));
+        out.push({
+          source: "replay-memory",
+          summary,
+          reference: toRelativeOrAbsolute(args.workspaceRoot, args.replayPathAbs),
+          tokens,
+          baseScore,
+          timestampMs: parseTimeMs(entry.updatedAt),
+          acceptedMitigation: false,
+          failureFrequency: 1,
+          negativeMitigation: false,
+        });
+      }
+    } catch {
+      // Ignore malformed replay snapshot and continue with event log fallback.
+    }
+  }
+
+  const eventsPath = args.replayPathAbs.endsWith(".json")
+    ? `${args.replayPathAbs.slice(0, Math.max(0, args.replayPathAbs.length - 5))}.events.ndjson`
+    : `${args.replayPathAbs}.events.ndjson`;
+  if (!existsSync(eventsPath)) return out;
+
+  try {
+    const raw = readFileSync(eventsPath, "utf8");
+    const lines = raw
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .slice(-500);
+    for (const line of lines) {
+      let parsed: {
+        type?: string;
+        recommendedQueries?: string[];
+        seedQueries?: string[];
+        topHitPaths?: string[];
+        score?: number;
+        timestamp?: string;
+      } | null = null;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || parsed.type !== "replay_outcome") continue;
+      const recommended = (parsed.recommendedQueries ?? []).slice(0, 3);
+      const seedQueries = (parsed.seedQueries ?? []).slice(0, 3);
+      const topHitPaths = (parsed.topHitPaths ?? []).slice(0, 2);
+      if (recommended.length === 0 && seedQueries.length === 0 && topHitPaths.length === 0) continue;
+
+      const summary = trimText(
+        `Recent replay outcome. Recommended retrieval queries: ${recommended.join(" | ")}. Seed context: ${
+          seedQueries.join(" | ")
+        }. Top prior hits: ${topHitPaths.join(", ")}`,
+        420,
+      );
+      const tokens = tokenizeForRecall(`${summary} ${recommended.join(" ")} ${seedQueries.join(" ")}`);
+      if (tokens.size === 0) continue;
+
+      out.push({
+        source: "replay-memory",
+        summary,
+        reference: toRelativeOrAbsolute(args.workspaceRoot, eventsPath),
+        tokens,
+        baseScore: Math.min(1, clampNonNegativeNumber(parsed.score, 0) + 0.2),
+        timestampMs: parseTimeMs(parsed.timestamp),
+        acceptedMitigation: false,
+        failureFrequency: 1,
+        negativeMitigation: false,
+      });
+    }
+  } catch {
+    return out;
+  }
+
+  return out;
+}
+
+function loadArtifactMemoryCandidates(args: {
+  workspaceRoot: string;
+  artifactsDirRel: string;
+  maxCandidates: number;
+}): MemoryRevisitCandidate[] {
+  const artifactsDirAbs = path.resolve(args.workspaceRoot, args.artifactsDirRel);
+  if (!existsSync(artifactsDirAbs)) return [];
+
+  type ArtifactEntry = { filePath: string; mtimeMs: number };
+  const files: ArtifactEntry[] = [];
+  const queue = [artifactsDirAbs];
+
+  while (queue.length > 0) {
+    const dir = queue.shift() as string;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(dir, entry);
+      let stats;
+      try {
+        stats = statSync(full);
+      } catch {
+        continue;
+      }
+
+      if (stats.isDirectory()) {
+        queue.push(full);
+        continue;
+      }
+
+      if (!entry.endsWith(".artifact.json")) continue;
+      files.push({ filePath: full, mtimeMs: stats.mtimeMs || 0 });
+    }
+  }
+
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const out: MemoryRevisitCandidate[] = [];
+  for (const item of files.slice(0, Math.max(1, args.maxCandidates))) {
+    let parsed: {
+      moduleId?: string;
+      status?: string;
+      riskNotes?: string[];
+      criticFindings?: Array<{ severity?: string; message?: string; source?: string }>;
+      changedFiles?: Array<{ path?: string; change?: string }>;
+      repairTaskPath?: string | null;
+    } | null = null;
+
+    try {
+      parsed = JSON.parse(readFileSync(item.filePath, "utf8"));
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) continue;
+
+    const moduleId = String(parsed.moduleId ?? "unknown-module").trim();
+    const status = String(parsed.status ?? "unknown").trim();
+    const riskNotes = (parsed.riskNotes ?? []).filter((value): value is string => typeof value === "string").slice(0, 2);
+    const criticNotes = (parsed.criticFindings ?? [])
+      .slice(0, 2)
+      .map((finding) => `${finding.severity ?? "info"}:${finding.source ?? "critic"}:${finding.message ?? ""}`.trim());
+    const changedPaths = (parsed.changedFiles ?? [])
+      .slice(0, 3)
+      .map((change) => `${change.change ?? "mod"}:${change.path ?? "unknown"}`);
+
+    const summary = trimText(
+      [
+        `Module ${moduleId} finished ${status}.`,
+        riskNotes.length > 0 ? `Risk notes: ${riskNotes.join(" | ")}` : "",
+        criticNotes.length > 0 ? `Critic: ${criticNotes.join(" | ")}` : "",
+        changedPaths.length > 0 ? `Changed files: ${changedPaths.join(", ")}` : "",
+        parsed.repairTaskPath ? `Repair path: ${parsed.repairTaskPath}` : "",
+      ]
+        .filter((line) => line.length > 0)
+        .join(" "),
+      420,
+    );
+
+    const tokens = tokenizeForRecall(`${summary} ${moduleId} ${status} ${riskNotes.join(" ")} ${criticNotes.join(" ")}`);
+    if (tokens.size === 0) continue;
+
+    const baseScore = status === "success" && parsed.repairTaskPath ? 0.8 : status === "failed" ? 0.65 : 0.55;
+    out.push({
+      source: "artifact-contract",
+      summary,
+      reference: toRelativeOrAbsolute(args.workspaceRoot, item.filePath),
+      tokens,
+      baseScore,
+      timestampMs: item.mtimeMs || 0,
+      acceptedMitigation: false,
+      failureFrequency: 1,
+      negativeMitigation: false,
+    });
+  }
+
+  return out;
+}
+
+function loadSemanticMemoryCandidates(args: {
+  workspaceRoot: string;
+  recipeId: string;
+  policyPacks: string[];
+  autonomyDir: string;
+  memoryPath?: string;
+}): MemoryRevisitCandidate[] {
+  const semantic = readSemanticState({
+    workspaceRoot: args.workspaceRoot,
+    recipeId: args.recipeId,
+    policyPacks: args.policyPacks,
+    autonomyDir: args.autonomyDir,
+    memoryPath: args.memoryPath,
+  });
+  if (!semantic.state) return [];
+
+  const reference = toRelativeOrAbsolute(args.workspaceRoot, semantic.memoryPath);
+  const out: MemoryRevisitCandidate[] = [];
+  const failureFrequency = new Map<string, number>();
+  for (const failure of semantic.state.failedAttempts) {
+    const key = `${failure.moduleId.toLowerCase()}|${failure.reason.toLowerCase()}`;
+    failureFrequency.set(key, (failureFrequency.get(key) ?? 0) + 1);
+  }
+
+  for (const failure of semantic.state.failedAttempts.slice(-80)) {
+    const summary = trimText(
+      `Failed module ${failure.moduleId} attempt ${failure.attempt}: ${failure.reason}`,
+      420,
+    );
+    const tokens = tokenizeForRecall(`${summary} ${failure.moduleId}`);
+    if (tokens.size === 0) continue;
+    const failureKey = `${failure.moduleId.toLowerCase()}|${failure.reason.toLowerCase()}`;
+    out.push({
+      source: "semantic-memory",
+      summary,
+      reference,
+      tokens,
+      baseScore: 0.72,
+      timestampMs: parseTimeMs(failure.timestamp),
+      acceptedMitigation: false,
+      failureFrequency: failureFrequency.get(failureKey) ?? 1,
+      negativeMitigation: false,
+    });
+  }
+
+  for (const mitigation of semantic.state.mitigations.slice(-80)) {
+    const accepted = mitigation.accepted ? "accepted" : "rejected";
+    const summary = trimText(
+      `Mitigation ${accepted} for module ${mitigation.moduleId}: ${mitigation.mitigation}`,
+      420,
+    );
+    const tokens = tokenizeForRecall(`${summary} ${mitigation.moduleId} ${accepted}`);
+    if (tokens.size === 0) continue;
+    out.push({
+      source: "semantic-memory",
+      summary,
+      reference,
+      tokens,
+      baseScore: mitigation.accepted ? 0.85 : 0.45,
+      timestampMs: parseTimeMs(mitigation.timestamp),
+      acceptedMitigation: mitigation.accepted,
+      failureFrequency: 1,
+      negativeMitigation: !mitigation.accepted,
+    });
+  }
+
+  for (const decision of semantic.state.decisions.slice(-80)) {
+    const summary = trimText(`Decision ${decision.decision}: ${decision.detail}`, 420);
+    const tokens = tokenizeForRecall(`${summary} ${decision.decision}`);
+    if (tokens.size === 0) continue;
+    out.push({
+      source: "semantic-memory",
+      summary,
+      reference,
+      tokens,
+      baseScore: 0.55,
+      timestampMs: parseTimeMs(decision.timestamp),
+      acceptedMitigation: false,
+      failureFrequency: 1,
+      negativeMitigation: false,
+    });
+  }
+
+  return out;
+}
+
+function defaultReplayMemoryPath(args: {
+  workspaceRoot: string;
+  recipeId: string;
+  autonomyDir: string;
+}): string {
+  const digest = createHash("sha1");
+  digest.update(path.resolve(args.workspaceRoot));
+  digest.update("|");
+  digest.update(args.recipeId);
+  const fingerprint = digest.digest("hex").slice(0, 20);
+  return path.resolve(args.workspaceRoot, args.autonomyDir, "rag", "replay", `${fingerprint}.json`);
+}
+
+function collectMemoryRevisitHits(args: {
+  config: MemoryRevisitConfig;
+  state: MemoryRevisitState;
+  workspaceRoot: string;
+  artifactsDirRel: string;
+  module: DagManifest["modules"][number];
+  attempt: number;
+  stderr: string;
+  criticFindings: DagCriticFinding[];
+  changedFiles: DagDiffFile[];
+  policyPacks: string[];
+}): DagMemoryRevisitHit[] {
+  if (!args.config.enabled) {
+    incrementSkipCounter(args.state, "disabled");
+    return [];
+  }
+
+  const usedCalls = args.state.callsByModule.get(args.module.id) ?? 0;
+  if (usedCalls >= args.config.maxCallsPerModule) {
+    incrementSkipCounter(args.state, "max_calls_per_module");
+    return [];
+  }
+
+  args.state.callsByModule.set(args.module.id, usedCalls + 1);
+  args.state.totalCalls += 1;
+
+  const queryText = trimText(
+    [
+      args.module.id,
+      args.module.title,
+      args.module.description,
+      `attempt ${args.attempt}`,
+      args.stderr,
+      args.criticFindings.map((finding) => `${finding.severity}:${finding.message}`).join(" "),
+      args.changedFiles.map((file) => `${file.change}:${file.path}`).join(" "),
+      args.policyPacks.join(" "),
+    ].join("\n"),
+    2200,
+  );
+  const queryTokens = tokenizeForRecall(queryText);
+  if (queryTokens.size === 0) {
+    incrementSkipCounter(args.state, "empty_query");
+    return [];
+  }
+
+  const candidates: MemoryRevisitCandidate[] = [];
+  if (args.config.recipeId) {
+    candidates.push(
+      ...loadSemanticMemoryCandidates({
+        workspaceRoot: args.workspaceRoot,
+        recipeId: args.config.recipeId,
+        policyPacks: args.policyPacks,
+        autonomyDir: args.config.autonomyDir,
+        memoryPath: args.config.semanticMemoryPath,
+      }),
+    );
+    candidates.push(
+      ...loadReplayMemoryEntries({
+        workspaceRoot: args.workspaceRoot,
+        replayPathAbs: args.config.replayMemoryPath
+          ? path.resolve(args.workspaceRoot, args.config.replayMemoryPath)
+          : defaultReplayMemoryPath({
+            workspaceRoot: args.workspaceRoot,
+            recipeId: args.config.recipeId,
+            autonomyDir: args.config.autonomyDir,
+          }),
+      }),
+    );
+  } else if (args.config.replayMemoryPath) {
+    candidates.push(
+      ...loadReplayMemoryEntries({
+        workspaceRoot: args.workspaceRoot,
+        replayPathAbs: path.resolve(args.workspaceRoot, args.config.replayMemoryPath),
+      }),
+    );
+  }
+
+  candidates.push(
+    ...loadArtifactMemoryCandidates({
+      workspaceRoot: args.workspaceRoot,
+      artifactsDirRel: args.artifactsDirRel,
+      maxCandidates: args.config.maxArtifactCandidates,
+    }),
+  );
+
+  for (const candidate of candidates) {
+    incrementSourceCounter(args.state.candidatesLoadedBySource, candidate.source);
+  }
+  if (candidates.length === 0) {
+    incrementSkipCounter(args.state, "no_candidates");
+    return [];
+  }
+
+  const nowMs = Date.now();
+  let belowThresholdCount = 0;
+  let negativeBlockedCount = 0;
+
+  const ranked = candidates
+    .map((candidate) => {
+      const overlap = overlapScore(queryTokens, candidate.tokens);
+      const recency = recencyScore(candidate.timestampMs, nowMs);
+      const acceptedBoost = candidate.acceptedMitigation ? 0.12 : 0;
+      const failurePenalty = Math.min(0.22, Math.max(0, candidate.failureFrequency - 1) * 0.035);
+      const negativePenalty = candidate.negativeMitigation ? 0.24 : 0;
+      const rawScore =
+        (overlap * 0.6) +
+        (Math.min(1, candidate.baseScore) * 0.2) +
+        (recency * 0.2) +
+        acceptedBoost -
+        failurePenalty -
+        negativePenalty;
+      const score = toScore(Math.max(0, Math.min(1, rawScore)));
+      return {
+        source: candidate.source,
+        overlap,
+        score,
+        summary: candidate.summary,
+        reference: candidate.reference,
+        negativeMitigation: candidate.negativeMitigation,
+      };
+    })
+    .filter((candidate) => {
+      if (candidate.negativeMitigation && candidate.overlap >= 0.45) {
+        negativeBlockedCount += 1;
+        return false;
+      }
+      if (candidate.score < args.config.minScore) {
+        belowThresholdCount += 1;
+        return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.source !== b.source) return a.source.localeCompare(b.source);
+      return a.summary.localeCompare(b.summary);
+    });
+  if (negativeBlockedCount > 0) {
+    incrementSkipCounter(args.state, "negative_memory_blocked", negativeBlockedCount);
+  }
+  if (belowThresholdCount > 0) {
+    incrementSkipCounter(args.state, "below_threshold", belowThresholdCount);
+  }
+
+  const unique = new Set<string>();
+  const hits: DagMemoryRevisitHit[] = [];
+  for (const item of ranked) {
+    const key = `${item.source}|${item.summary}|${item.reference ?? ""}`;
+    if (unique.has(key)) continue;
+    unique.add(key);
+    hits.push(item);
+    if (hits.length >= args.config.topK) break;
+  }
+
+  if (hits.length > 0) {
+    args.state.hitsUsed += hits.length;
+    for (const hit of hits) {
+      incrementSourceCounter(args.state.selectedBySource, hit.source);
+    }
+  }
+  return hits;
+}
+
+function mergeMemoryRevisitHits(base: DagMemoryRevisitHit[], next: DagMemoryRevisitHit[]): DagMemoryRevisitHit[] {
+  if (next.length === 0) return base;
+  const out = base.slice();
+  const seen = new Set(out.map((item) => `${item.source}|${item.summary}|${item.reference ?? ""}`));
+  for (const item of next) {
+    const key = `${item.source}|${item.summary}|${item.reference ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
 }
 
 async function runModuleCommand(command: string, cwd: string, timeoutMs: number): Promise<DagRunResult> {
@@ -591,6 +1508,45 @@ function resolveApprovalPath(args: {
   return path.join(approvalDirAbs, `wave-${args.level + 1}.approved.json`);
 }
 
+function isGateLikeModule(module: DagManifest["modules"][number]): boolean {
+  const haystack = `${module.id} ${module.title}`.toLowerCase();
+  return /\bgate\b/.test(haystack) ||
+    /\bsignoff\b/.test(haystack) ||
+    /\bchecklist\b/.test(haystack) ||
+    /\bverification\b/.test(haystack) ||
+    /\bvalidate\b/.test(haystack) ||
+    haystack.includes("delivery");
+}
+
+function isTestImpactEligibleModule(module: DagManifest["modules"][number]): boolean {
+  return module.mode === "implement";
+}
+
+function selectFullSuiteCheckpointModuleIds(modules: DagManifest["modules"]): Set<string> {
+  const implementModules = modules.filter((module) => module.mode === "implement");
+  if (implementModules.length === 0) return new Set<string>();
+
+  const dependents = new Map<string, number>();
+  for (const module of modules) {
+    for (const dep of module.dependsOn) {
+      dependents.set(dep, (dependents.get(dep) ?? 0) + 1);
+    }
+  }
+
+  const gateLike = implementModules
+    .filter((module) => isGateLikeModule(module))
+    .map((module) => module.id);
+  if (gateLike.length > 0) return new Set(gateLike);
+
+  const sinks = implementModules
+    .filter((module) => (dependents.get(module.id) ?? 0) === 0)
+    .map((module) => module.id);
+  if (sinks.length > 0) return new Set(sinks);
+
+  const fallback = implementModules[implementModules.length - 1]?.id;
+  return fallback ? new Set([fallback]) : new Set<string>();
+}
+
 function impactedPackages(args: {
   facts: WorkspaceFacts;
   changedFiles: DagDiffFile[];
@@ -635,6 +1591,9 @@ function testCommandForPackage(pkgPath: string): string {
 
 async function runTestImpact(args: {
   mode: "off" | "targeted" | "targeted_then_full";
+  applyMode: ApplyMode;
+  runFullSuiteInDryRun: boolean;
+  allowFullSuite: boolean;
   workspaceRoot: string;
   changedFiles: DagDiffFile[];
   facts: WorkspaceFacts;
@@ -647,6 +1606,7 @@ async function runTestImpact(args: {
       traces: [],
       commands: [],
       detail: "test impact disabled",
+      fullSuiteRan: false,
     };
   }
 
@@ -667,11 +1627,16 @@ async function runTestImpact(args: {
         traces,
         commands,
         detail: `targeted test failed for ${pkg.name}: ${trace.stderr || trace.stdout || "unknown error"}`,
+        fullSuiteRan: false,
       };
     }
   }
 
-  if (args.mode === "targeted_then_full") {
+  const shouldRunFullSuite = args.mode === "targeted_then_full" &&
+    args.allowFullSuite &&
+    (args.applyMode === "apply" || args.runFullSuiteInDryRun);
+
+  if (shouldRunFullSuite) {
     commands.push(args.fullTestCommand);
     const full = await runCommandCheck(args.fullTestCommand, args.workspaceRoot, args.timeoutMs);
     const fullTrace = toCommandTrace(args.fullTestCommand, full);
@@ -683,6 +1648,7 @@ async function runTestImpact(args: {
         traces,
         commands,
         detail: `full test suite failed: ${fullTrace.stderr || fullTrace.stdout || "unknown error"}`,
+        fullSuiteRan: true,
       };
     }
   }
@@ -693,6 +1659,17 @@ async function runTestImpact(args: {
       traces,
       commands,
       detail: "no impacted packages with test:run script",
+      fullSuiteRan: false,
+    };
+  }
+
+  if (args.mode === "targeted_then_full" && args.allowFullSuite && !shouldRunFullSuite) {
+    return {
+      passed: true,
+      traces,
+      commands,
+      detail: "full-suite test gate skipped in dry-run mode",
+      fullSuiteRan: false,
     };
   }
 
@@ -701,6 +1678,7 @@ async function runTestImpact(args: {
     traces,
     commands,
     detail: "ok",
+    fullSuiteRan: shouldRunFullSuite,
   };
 }
 
@@ -729,14 +1707,23 @@ function shouldFailForSeverity(args: {
 
 function runBasicCritic(args: {
   moduleMode: "analyze" | "implement";
+  applyMode: ApplyMode;
+  moduleId: string;
+  moduleTitle: string;
   changedFiles: DagDiffFile[];
 }): DagCriticFinding[] {
   const findings: DagCriticFinding[] = [];
 
   if (args.moduleMode === "implement" && args.changedFiles.length === 0) {
+    const hint = `${args.moduleId} ${args.moduleTitle}`.toLowerCase();
+    const isGateLike = /\bgate\b/.test(hint) || hint.includes("verify") || hint.includes("validation");
     findings.push({
-      severity: "blocker",
-      message: "No file changes detected for implement module.",
+      severity: isGateLike ? "info" : args.applyMode === "apply" ? "warning" : "info",
+      message: isGateLike
+        ? "No file changes detected for gate/verification module (allowed)."
+        : args.applyMode === "apply"
+        ? "No file changes detected for implement module; verify this is an intended no-op."
+        : "No file changes detected in dry-run mode (expected for planning-only providers).",
       source: "basic-critic",
     });
   }
@@ -910,6 +1897,41 @@ function dedupeFindings(findings: DagCriticFinding[]): DagCriticFinding[] {
   return out;
 }
 
+function limitChangedFiles(changedFiles: DagDiffFile[], limit: number): {
+  items: DagDiffFile[];
+  omitted: number;
+} {
+  const safeLimit = Math.max(1, Math.trunc(limit));
+  if (changedFiles.length <= safeLimit) {
+    return { items: changedFiles, omitted: 0 };
+  }
+  return {
+    items: changedFiles.slice(0, safeLimit),
+    omitted: changedFiles.length - safeLimit,
+  };
+}
+
+function serializeChangedFilesForContext(changedFiles: DagDiffFile[]): string {
+  const limited = limitChangedFiles(changedFiles, CHANGED_FILES_CONTEXT_LIMIT);
+  const compact = limited.items.map((change) => `${change.change}:${change.path}`);
+  if (limited.omitted > 0) {
+    compact.push(`truncated:${limited.omitted}`);
+  }
+  return JSON.stringify(compact);
+}
+
+function changedFilesForArtifact(changedFiles: DagDiffFile[]): DagDiffFile[] {
+  const limited = limitChangedFiles(changedFiles, CHANGED_FILES_ARTIFACT_LIMIT);
+  if (limited.omitted === 0) return limited.items;
+  return [
+    ...limited.items,
+    {
+      path: `__omitted__:${limited.omitted} additional file changes`,
+      change: "modified",
+    },
+  ];
+}
+
 function renderPolicyCriticPrompts(args: {
   rules: ResolvedPolicyCriticRule[];
   module: DagManifest["modules"][number];
@@ -920,7 +1942,7 @@ function renderPolicyCriticPrompts(args: {
 }): string {
   if (args.rules.length === 0) return "";
 
-  const changedFiles = JSON.stringify(args.changedFiles.map((change) => `${change.change}:${change.path}`));
+  const changedFiles = serializeChangedFilesForContext(args.changedFiles);
   const sections: string[] = [];
 
   for (const rule of args.rules) {
@@ -991,6 +2013,9 @@ async function runCritic(args: {
   const baseFindings = dedupeFindings([
     ...runBasicCritic({
       moduleMode: args.module.mode,
+      applyMode: args.applyMode,
+      moduleId: args.module.id,
+      moduleTitle: args.module.title,
       changedFiles: args.changedFiles,
     }),
     ...runPolicyCriticChecks({
@@ -1025,7 +2050,7 @@ async function runCritic(args: {
     };
   }
 
-  const changedFilesJson = JSON.stringify(args.changedFiles.map((change) => `${change.change}:${change.path}`));
+  const changedFilesJson = serializeChangedFilesForContext(args.changedFiles);
   const policyCriticPrompts = renderPolicyCriticPrompts({
     rules: args.policyCriticRules,
     module: args.module,
@@ -1091,6 +2116,7 @@ function writeModuleArtifact(args: {
   workspaceRoot: string;
   artifactsDirRel: string;
   moduleId: string;
+  inputDigest: string | null;
   attempt: number;
   status: DagRunResult["status"];
   changedFiles: DagDiffFile[];
@@ -1101,23 +2127,33 @@ function writeModuleArtifact(args: {
   riskNotes: string[];
   policyPacks: string[];
   repairTaskPath: string | null;
+  memoryRevisit: DagMemoryRevisitHit[];
 }): string {
   const artifactPathRel = normalizePathForOutput(path.join(args.artifactsDirRel, `${args.moduleId}.attempt-${args.attempt}.artifact.json`));
   const artifactAbs = path.resolve(args.workspaceRoot, artifactPathRel);
+  const artifactChangedFiles = changedFilesForArtifact(args.changedFiles);
+  const riskNotes = args.riskNotes.slice();
+  const omittedMarker = artifactChangedFiles.find((file) => file.path.startsWith("__omitted__:"));
+  if (omittedMarker) {
+    const omitted = omittedMarker.path.replace("__omitted__:", "");
+    riskNotes.push(`changedFiles truncated for artifact contract (${omitted})`);
+  }
 
   const artifact = DagModuleArtifactSchema.parse({
     moduleId: args.moduleId,
     generatedAt: new Date().toISOString(),
     attempt: args.attempt,
     status: args.status,
-    changedFiles: args.changedFiles,
+    inputDigest: args.inputDigest,
+    changedFiles: artifactChangedFiles,
     command: args.command,
     critic: args.critic,
     criticFindings: args.criticFindings,
     testImpact: args.testImpact,
-    riskNotes: args.riskNotes,
+    riskNotes,
     policyPacks: args.policyPacks,
     repairTaskPath: args.repairTaskPath,
+    memoryRevisit: args.memoryRevisit,
   });
 
   mkdirSync(path.dirname(artifactAbs), { recursive: true });
@@ -1134,6 +2170,7 @@ function createRepairTask(args: {
   command: string | null;
   stderr: string;
   artifactPath: string | null;
+  memoryRevisit: DagMemoryRevisitHit[];
 }): string {
   const taskPathRel = normalizePathForOutput(path.join(
     args.repairsDirRel,
@@ -1161,6 +2198,17 @@ function createRepairTask(args: {
     "- Record risk notes and mitigation in the next artifact.",
     "",
   ];
+
+  if (args.memoryRevisit.length > 0) {
+    lines.push("## Recalled Evidence");
+    for (const hit of args.memoryRevisit) {
+      lines.push(`- [${hit.source}] score=${hit.score.toFixed(3)} ${hit.summary}`);
+      if (hit.reference) {
+        lines.push(`  ref: ${hit.reference}`);
+      }
+    }
+    lines.push("");
+  }
 
   mkdirSync(path.dirname(taskAbs), { recursive: true });
   writeFileSync(taskAbs, `${lines.join("\n")}\n`, "utf8");
@@ -1256,18 +2304,37 @@ export async function runDag(args: {
   requireArtifactContract?: boolean;
   testImpactMode?: "off" | "targeted" | "targeted_then_full";
   fullTestCommand?: string;
+  fullTestInDryRun?: boolean;
+  runAnalyzeInDryRun?: boolean;
+  analyzeTimeoutMs?: number;
+  resumeSuccessModules?: boolean;
   canaryLimitModules?: number;
   canaryCompareCommand?: string;
   maxParallel?: number;
   policyPacks?: string[];
   policyCriticConfigPath?: string;
+  memoryRevisitEnabled?: boolean;
+  memoryRevisitRecipeId?: string;
+  memoryRevisitAutonomyDir?: string;
+  memoryRevisitSemanticMemoryPath?: string;
+  memoryRevisitReplayMemoryPath?: string;
+  memoryRevisitMaxCallsPerModule?: number;
+  memoryRevisitTopK?: number;
+  memoryRevisitMinScore?: number;
+  memoryRevisitMaxArtifactCandidates?: number;
 }): Promise<DagRunSummary> {
   const runStartedAt = new Date().toISOString();
   const runStartedAtMs = Date.now();
   const workspaceRoot = path.resolve(args.workspaceRoot);
   const manifestAbs = path.resolve(workspaceRoot, args.manifestPath);
   const manifest = loadManifest(manifestAbs);
+  const gitRepoRoot = resolveGitRepoRoot(workspaceRoot);
   const timeoutMs = Math.max(1000, args.timeoutMs ?? 10 * 60 * 1000);
+  const analyzeTimeoutMs = clampAtLeastInt(
+    args.analyzeTimeoutMs,
+    Math.min(timeoutMs, DEFAULT_ANALYZE_TIMEOUT_MS),
+    1000,
+  );
   const failPolicy = args.failPolicy ?? "graph";
   const dryRun = Boolean(args.dryRun);
   const executorProfile = args.executorProfile ?? "none";
@@ -1277,11 +2344,32 @@ export async function runDag(args: {
   const requireArtifactContract = args.requireArtifactContract ?? true;
   const testImpactMode = args.testImpactMode ?? "off";
   const fullTestCommand = args.fullTestCommand ?? "npm run test:run";
+  const runAnalyzeInDryRun = args.runAnalyzeInDryRun ?? false;
+  const resumeSuccessModules = args.resumeSuccessModules ?? true;
   const enableRepairLoop = args.enableRepairLoop ?? false;
   const maxRepairAttempts = Math.max(0, args.maxRepairAttempts ?? 1);
   const maxParallel = Math.max(1, Math.trunc(args.maxParallel ?? 1));
   const policyPacks = (args.policyPacks ?? []).filter((entry) => entry.trim().length > 0);
   const criticFailLevel = DagCriticSeveritySchema.parse(args.criticFailLevel ?? "blocker");
+  const memoryRevisitConfig: MemoryRevisitConfig = {
+    enabled: (args.memoryRevisitEnabled ?? true) && enableRepairLoop,
+    recipeId: args.memoryRevisitRecipeId?.trim() ? args.memoryRevisitRecipeId.trim() : null,
+    autonomyDir: normalizePathForOutput(args.memoryRevisitAutonomyDir ?? "generated/orchestration/autonomy"),
+    semanticMemoryPath: args.memoryRevisitSemanticMemoryPath,
+    replayMemoryPath: args.memoryRevisitReplayMemoryPath,
+    maxCallsPerModule: clampAtLeastInt(args.memoryRevisitMaxCallsPerModule, 1, 0),
+    topK: clampAtLeastInt(args.memoryRevisitTopK, 3, 1),
+    minScore: clampNonNegativeNumber(args.memoryRevisitMinScore, 0),
+    maxArtifactCandidates: clampAtLeastInt(args.memoryRevisitMaxArtifactCandidates, 120, 1),
+  };
+  const memoryRevisitState: MemoryRevisitState = {
+    totalCalls: 0,
+    hitsUsed: 0,
+    callsByModule: new Map<string, number>(),
+    candidatesLoadedBySource: emptySourceCounters(),
+    selectedBySource: emptySourceCounters(),
+    skippedByReason: emptySkipCounters(),
+  };
   const policyCriticConfig = loadPolicyCriticConfig({
     workspaceRoot,
     configPath: args.policyCriticConfigPath,
@@ -1343,6 +2431,22 @@ export async function runDag(args: {
   }
 
   const moduleById = new Map(manifest.modules.map((module) => [module.id, module]));
+  const requestAbs = path.resolve(workspaceRoot, manifest.requestPath);
+  const requestDigest = sha256File(requestAbs);
+  const gitIgnoredPrefixesBase = dryRun
+    ? []
+    : loadGitIgnoredPrefixes({
+      workspaceRoot,
+      gitRepoRoot,
+    });
+  const resumeArtifactsByModule = resumeSuccessModules
+    ? loadLatestSuccessfulArtifacts({
+      workspaceRoot,
+      artifactsDirRel,
+    })
+    : new Map<string, ResumeArtifactEntry>();
+  const fullSuiteCheckpointModuleIds = selectFullSuiteCheckpointModuleIds(manifest.modules);
+  let fullSuiteCheckpointSatisfied = false;
   const failedModules = new Set<string>();
   const resultByModule = new Map<string, DagRunResult>();
 
@@ -1350,6 +2454,7 @@ export async function runDag(args: {
   const workspaceFacts = testImpactMode === "off" ? null : discoverWorkspaceFacts(workspaceRoot);
 
   let repairsGenerated = 0;
+  let resumedModules = 0;
   const shouldHalt = (): boolean => {
     if (failPolicy === "global" && failedModules.size > 0) return true;
     if (budgetConfig.failFast && failedModules.size > 0) return true;
@@ -1429,11 +2534,55 @@ export async function runDag(args: {
       });
     }
 
+    const moduleInputDigest = computeModuleInputDigest({
+      module,
+      partFileAbs: modulePartAbs,
+      requestDigest,
+      applyMode,
+      policyPacks,
+      resolvedCommand: initialCommand,
+    });
+
+    const resumeHit = resumeArtifactsByModule.get(module.id);
+    if (
+      resumeHit &&
+      resumeHit.inputDigest &&
+      resumeHit.inputDigest === moduleInputDigest
+    ) {
+      resumedModules += 1;
+      return DagRunResultSchema.parse({
+        moduleId: module.id,
+        status: "success",
+        command: resumeHit.artifact.command?.command ?? initialCommand,
+        code: resumeHit.artifact.command?.code ?? 0,
+        stdout: `resumed from prior successful artifact (${resumeHit.artifactPathRel})`,
+        stderr: "",
+        durationMs: 0,
+        attempt: resumeHit.attempt,
+        tokensEstimate: 0,
+        changedFiles: [],
+        artifactPath: resumeHit.artifactPathRel,
+        criticPassed: true,
+        criticSeverity: highestSeverity(resumeHit.artifact.criticFindings ?? []),
+        criticFindings: resumeHit.artifact.criticFindings ?? [],
+        repairTaskPath: resumeHit.artifact.repairTaskPath ?? null,
+        memoryRevisit: resumeHit.artifact.memoryRevisit ?? [],
+        testImpactCommands: (resumeHit.artifact.testImpact ?? []).map((trace) => trace.command),
+        tokenAccountingMode: "estimated",
+        tokensObserved: 0,
+        tokensEstimated: 0,
+        tokensEffective: 0,
+        resumedFromArtifact: true,
+      });
+    }
+
     let attempt = 1;
     let repairTaskPath: string | null = null;
     let commandForAttempt: string | null = initialCommand;
     let partFileForAttempt = modulePartAbs;
     let lastResult: DagRunResult | null = null;
+    let accumulatedMemoryRevisit: DagMemoryRevisitHit[] = [];
+    let attemptTimeoutMs = timeoutMs;
 
     while (commandForAttempt && attempt <= 1 + maxRepairAttempts) {
       const budgetReasons = computeBudgetExhaustion({
@@ -1475,27 +2624,139 @@ export async function runDag(args: {
           workspaceRoot,
           artifactsDirRel,
           repairsDirRel,
+          gitIgnoredPrefixes: gitIgnoredPrefixesBase,
         });
 
-      budgetState.totalAttempts += 1;
+      const shouldAutoPassAnalyzeInDryRun =
+        !dryRun && applyMode === "dry-run" && module.mode === "analyze" && !runAnalyzeInDryRun;
 
-      const commandResult = dryRun
+      const moduleTimeoutBudgetMs = module.mode === "analyze"
+        ? Math.min(attemptTimeoutMs, analyzeTimeoutMs)
+        : attemptTimeoutMs;
+      const commandForExecution = maybeInjectProviderTimeout(commandForAttempt, moduleTimeoutBudgetMs);
+      const commandTimeoutMs = commandForExecution.includes("timeboxed.sh")
+        ? Math.max(1_000, moduleTimeoutBudgetMs + 30_000)
+        : Math.max(1_000, moduleTimeoutBudgetMs);
+
+      let commandResult = shouldAutoPassAnalyzeInDryRun
         ? DagRunResultSchema.parse({
           moduleId: module.id,
           status: "success",
-          command: commandForAttempt,
+          command: commandForExecution,
+          code: 0,
+          stdout: "analyze auto-pass in apply-mode dry-run",
+          stderr: "",
+          durationMs: 0,
+        })
+        : dryRun
+        ? DagRunResultSchema.parse({
+          moduleId: module.id,
+          status: "success",
+          command: commandForExecution,
           code: 0,
           stdout: "dry-run",
           stderr: "",
           durationMs: 0,
         })
         : DagRunResultSchema.parse({
-          ...(await runModuleCommand(commandForAttempt, workspaceRoot, timeoutMs)),
+          ...(await runModuleCommand(commandForExecution, workspaceRoot, commandTimeoutMs)),
           moduleId: module.id,
         });
 
+      let analyzeTimeoutFallbackNote = "";
+      const shouldSoftPassAnalyzeTimeout =
+        !dryRun &&
+        module.mode === "analyze" &&
+        commandResult.status === "failed" &&
+        commandResult.code === 124;
+
+      if (shouldSoftPassAnalyzeTimeout) {
+        const timeoutDetail = (commandResult.stderr || commandResult.stdout || "provider timeout").trim();
+        const compactTimeoutDetail = timeoutDetail.length > 240
+          ? `${timeoutDetail.slice(0, 240)}...`
+          : timeoutDetail;
+        analyzeTimeoutFallbackNote = `analyze-timeout-fallback applied (${compactTimeoutDetail})`;
+        commandResult = DagRunResultSchema.parse({
+          ...commandResult,
+          status: "success",
+          code: 0,
+          stdout: [commandResult.stdout, analyzeTimeoutFallbackNote].filter((line) => line.trim().length > 0).join("\n"),
+          stderr: "",
+        });
+      }
+
+      let implementGateTimeoutFallbackNote = "";
+      const shouldSoftPassImplementGateTimeout =
+        !dryRun &&
+        applyMode === "dry-run" &&
+        module.mode === "implement" &&
+        isGateLikeModule(module) &&
+        commandResult.status === "failed" &&
+        commandResult.code === 124;
+
+      if (shouldSoftPassImplementGateTimeout) {
+        const timeoutDetail = (commandResult.stderr || commandResult.stdout || "provider timeout").trim();
+        const compactTimeoutDetail = timeoutDetail.length > 240
+          ? `${timeoutDetail.slice(0, 240)}...`
+          : timeoutDetail;
+        implementGateTimeoutFallbackNote = `implement-gate-timeout-fallback applied (${compactTimeoutDetail})`;
+        commandResult = DagRunResultSchema.parse({
+          ...commandResult,
+          status: "success",
+          code: 0,
+          stdout: [commandResult.stdout, implementGateTimeoutFallbackNote]
+            .filter((line) => line.trim().length > 0)
+            .join("\n"),
+          stderr: "",
+        });
+      }
+
+      let moduleStatusMarkerFallbackNote = "";
+      const moduleStatusMarker = parseModuleStatusMarker(`${commandResult.stdout}\n${commandResult.stderr}`);
+      if (!dryRun && commandResult.status === "failed" && commandResult.code === 124 && moduleStatusMarker === "success") {
+        moduleStatusMarkerFallbackNote = "module-status-timeout-fallback applied (MODULE_STATUS: success)";
+        commandResult = DagRunResultSchema.parse({
+          ...commandResult,
+          status: "success",
+          code: 0,
+          stdout: [commandResult.stdout, moduleStatusMarkerFallbackNote]
+            .filter((line) => line.trim().length > 0)
+            .join("\n"),
+          stderr: "",
+        });
+      } else if (!dryRun && commandResult.status === "success" && moduleStatusMarker === "failed") {
+        commandResult = DagRunResultSchema.parse({
+          ...commandResult,
+          status: "failed",
+          code: commandResult.code ?? 2,
+          stderr: [commandResult.stderr, "provider reported MODULE_STATUS: failed"]
+            .filter((line) => line.trim().length > 0)
+            .join("\n"),
+        });
+      }
+
+      if (module.mode === "implement") {
+        budgetState.totalAttempts += 1;
+      }
+
+      const refusalLabel =
+        !dryRun && module.mode === "implement" && commandResult.status === "success"
+          ? detectAutonomyRefusal(`${commandResult.stdout}\n${commandResult.stderr}`)
+          : null;
+
+      if (refusalLabel) {
+        commandResult = DagRunResultSchema.parse({
+          ...commandResult,
+          status: "failed",
+          code: commandResult.code ?? 2,
+          stderr: [commandResult.stderr, `non-actionable provider response detected (${refusalLabel})`]
+            .filter((line) => line.trim().length > 0)
+            .join("\n"),
+        });
+      }
+
       const commandTrace: DagCommandTrace = {
-        command: commandForAttempt,
+        command: commandForExecution,
         passed: commandResult.status === "success",
         code: commandResult.code,
         durationMs: commandResult.durationMs,
@@ -1509,12 +2770,19 @@ export async function runDag(args: {
           workspaceRoot,
           artifactsDirRel,
           repairsDirRel,
+          gitIgnoredPrefixes: mergeGitIgnoredPrefixes(
+            gitIgnoredPrefixesBase,
+            loadGitIgnoredPrefixes({
+              workspaceRoot,
+              gitRepoRoot,
+            }),
+          ),
         });
 
       const changedFiles = dryRun ? [] : diffSnapshots(beforeSnapshot, afterSnapshot);
 
       const critic = await runCritic({
-        enabled: !dryRun && (args.enableCritic ?? false),
+        enabled: !shouldAutoPassAnalyzeInDryRun && !dryRun && (args.enableCritic ?? false),
         workspaceRoot,
         timeoutMs,
         module,
@@ -1530,9 +2798,20 @@ export async function runDag(args: {
         failLevel: criticFailLevel,
       });
 
-      const testImpact = !dryRun && commandTrace.passed && critic.passed && workspaceFacts
+      const shouldRunTestImpact =
+        !dryRun &&
+        commandTrace.passed &&
+        critic.passed &&
+        workspaceFacts &&
+        isTestImpactEligibleModule(module);
+
+      const allowFullSuite = !fullSuiteCheckpointSatisfied && fullSuiteCheckpointModuleIds.has(module.id);
+      const testImpact = shouldRunTestImpact
         ? await runTestImpact({
           mode: testImpactMode,
+          applyMode,
+          runFullSuiteInDryRun: args.fullTestInDryRun ?? false,
+          allowFullSuite,
           workspaceRoot,
           changedFiles,
           facts: workspaceFacts,
@@ -1544,7 +2823,11 @@ export async function runDag(args: {
           traces: [] as DagCommandTrace[],
           commands: [] as string[],
           detail: dryRun ? "dry-run" : "test impact skipped",
+          fullSuiteRan: false,
         };
+      if (testImpact.fullSuiteRan) {
+        fullSuiteCheckpointSatisfied = true;
+      }
 
       const status: DagRunResult["status"] =
         !commandTrace.passed
@@ -1557,8 +2840,31 @@ export async function runDag(args: {
 
       const riskNotes: string[] = [];
       if (!commandTrace.passed && commandTrace.stderr) riskNotes.push(commandTrace.stderr.slice(0, 500));
+      if (shouldAutoPassAnalyzeInDryRun) riskNotes.push("analyze auto-pass in apply-mode dry-run");
+      if (analyzeTimeoutFallbackNote) riskNotes.push(analyzeTimeoutFallbackNote);
+      if (implementGateTimeoutFallbackNote) riskNotes.push(implementGateTimeoutFallbackNote);
+      if (moduleStatusMarkerFallbackNote) riskNotes.push(moduleStatusMarkerFallbackNote);
       riskNotes.push(...critic.riskNotes);
       if (!testImpact.passed) riskNotes.push(testImpact.detail);
+
+      const memoryRevisit = status === "success"
+        ? []
+        : collectMemoryRevisitHits({
+          config: memoryRevisitConfig,
+          state: memoryRevisitState,
+          workspaceRoot,
+          artifactsDirRel,
+          module,
+          attempt,
+          stderr: [commandTrace.stderr, critic.detail, testImpact.detail].filter((line) => line).join("\n"),
+          criticFindings: critic.findings,
+          changedFiles,
+          policyPacks,
+        });
+      accumulatedMemoryRevisit = mergeMemoryRevisitHits(accumulatedMemoryRevisit, memoryRevisit);
+      const memoryRevisitForResult = accumulatedMemoryRevisit.length > 0
+        ? accumulatedMemoryRevisit
+        : memoryRevisit;
 
       let artifactPath: string | null = null;
       let artifactError: string | null = null;
@@ -1567,6 +2873,7 @@ export async function runDag(args: {
           workspaceRoot,
           artifactsDirRel,
           moduleId: module.id,
+          inputDigest: moduleInputDigest,
           attempt,
           status,
           changedFiles,
@@ -1577,6 +2884,7 @@ export async function runDag(args: {
           riskNotes,
           policyPacks,
           repairTaskPath,
+          memoryRevisit,
         });
       } catch (error) {
         artifactError = (error as Error).message;
@@ -1607,7 +2915,7 @@ export async function runDag(args: {
       const outputResult = DagRunResultSchema.parse({
         moduleId: module.id,
         status: finalStatus,
-        command: commandForAttempt,
+        command: commandForExecution,
         code: commandTrace.code,
         stdout: commandTrace.stdout,
         stderr: stderrParts.join("\n"),
@@ -1623,6 +2931,7 @@ export async function runDag(args: {
         criticSeverity: critic.severity,
         criticFindings: critic.findings,
         repairTaskPath,
+        memoryRevisit: memoryRevisitForResult,
         testImpactCommands: testImpact.commands,
         tokenAccountingMode:
           tokenAccounting.observedTraceCount > 0 && tokenAccounting.estimatedTraceCount > 0
@@ -1633,6 +2942,7 @@ export async function runDag(args: {
         tokensObserved: tokenAccounting.totalTokensObserved,
         tokensEstimated: tokenAccounting.totalTokensEstimated,
         tokensEffective: tokenAccounting.totalTokensEffective,
+        resumedFromArtifact: false,
       });
 
       lastResult = outputResult;
@@ -1645,14 +2955,24 @@ export async function runDag(args: {
         break;
       }
 
+      let retryTimeoutNote = "";
+      if (outputResult.code === 124 && module.mode === "implement") {
+        const nextTimeout = computeRetryTimeoutBudgetMs(attemptTimeoutMs, timeoutMs);
+        if (nextTimeout > attemptTimeoutMs) {
+          retryTimeoutNote = `retry timeout budget increased from ${attemptTimeoutMs}ms to ${nextTimeout}ms`;
+          attemptTimeoutMs = nextTimeout;
+        }
+      }
+
       repairTaskPath = createRepairTask({
         workspaceRoot,
         repairsDirRel,
         module,
         attempt,
-        command: commandForAttempt,
-        stderr: outputResult.stderr,
+        command: commandForExecution,
+        stderr: [outputResult.stderr, retryTimeoutNote].filter((line) => line.trim().length > 0).join("\n"),
         artifactPath: outputResult.artifactPath,
+        memoryRevisit: memoryRevisit,
       });
       repairsGenerated += 1;
 
@@ -1899,6 +3219,7 @@ export async function runDag(args: {
     completedAt: new Date().toISOString(),
     status,
     results: finalResults,
+    resumedModules,
     repairsGenerated,
     policyPacks,
     artifactsDir: artifactsDirRel,
@@ -1916,6 +3237,17 @@ export async function runDag(args: {
         failureDetail: canaryFailureDetail,
       }
       : undefined,
+    memoryRevisit: {
+      enabled: memoryRevisitConfig.enabled,
+      maxCallsPerModule: memoryRevisitConfig.maxCallsPerModule,
+      topK: memoryRevisitConfig.topK,
+      minScore: memoryRevisitConfig.minScore,
+      totalCalls: memoryRevisitState.totalCalls,
+      hitsUsed: memoryRevisitState.hitsUsed,
+      candidatesLoadedBySource: memoryRevisitState.candidatesLoadedBySource,
+      selectedBySource: memoryRevisitState.selectedBySource,
+      skippedByReason: memoryRevisitState.skippedByReason,
+    },
   });
 
   if (args.outputPath) {

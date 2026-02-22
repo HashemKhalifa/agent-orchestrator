@@ -1,6 +1,7 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildRagIndex } from "./indexer.js";
 import { queryRagIndex } from "./retriever.js";
@@ -154,5 +155,50 @@ describe("RAG index + query", () => {
     expect(refined.budget.maxTokenBudget).toBe(0);
     expect(refined.budget.usedTokensEstimate).toBeGreaterThan(0);
     expect(refined.budget.stopReason).not.toBe("token_budget_reached");
+  });
+
+  it("enforces index size guards for large inputs", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-rag-size-guards-"));
+    cleanup.push(root);
+
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "src", "small.ts"), "export const x = 1;\n", "utf8");
+    writeFileSync(path.join(root, "src", "huge.ts"), "a".repeat(300_000), "utf8");
+
+    const index = buildRagIndex({
+      workspaceRoot: root,
+      maxFiles: 50,
+      maxFileBytes: 100_000,
+      maxChunks: 2,
+      maxTotalChars: 60,
+      maxCharsPerChunk: 100,
+      linesPerChunk: 1,
+    });
+
+    expect(index.chunkCount).toBeLessThanOrEqual(2);
+    expect(index.chunks.every((chunk) => chunk.filePath !== "src/huge.ts")).toBe(true);
+  });
+
+  it("respects gitignored paths in nested workspace roots", () => {
+    const repoRoot = mkdtempSync(path.join(os.tmpdir(), "orchestrator-rag-gitignore-"));
+    const workspaceRoot = path.join(repoRoot, "packages", "app");
+    cleanup.push(repoRoot);
+
+    try {
+      execFileSync("git", ["--version"], { stdio: "ignore" });
+    } catch {
+      return;
+    }
+
+    mkdirSync(path.join(workspaceRoot, "src"), { recursive: true });
+    mkdirSync(path.join(workspaceRoot, ".custom-cache"), { recursive: true });
+    writeFileSync(path.join(repoRoot, ".gitignore"), "packages/app/.custom-cache/\n", "utf8");
+    writeFileSync(path.join(workspaceRoot, "src", "real.ts"), "export const real = true;\n", "utf8");
+    writeFileSync(path.join(workspaceRoot, ".custom-cache", "noise.ts"), "export const noise = true;\n", "utf8");
+    execFileSync("git", ["-C", repoRoot, "init", "-q"], { stdio: "ignore" });
+
+    const index = buildRagIndex({ workspaceRoot, maxFiles: 50 });
+    expect(index.chunks.some((chunk) => chunk.filePath.startsWith(".custom-cache/"))).toBe(false);
+    expect(index.chunks.some((chunk) => chunk.filePath === "src/real.ts")).toBe(true);
   });
 });

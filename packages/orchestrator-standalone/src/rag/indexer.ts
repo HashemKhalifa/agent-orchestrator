@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { buildEmbedding, toTermCounts, toTermFrequency, tokenize } from "./hybrid.js";
 import { RagIndexSchema, type RagChunk, type RagIndex } from "./types.js";
 
@@ -11,8 +12,11 @@ const IGNORE_DIRS = new Set([
   "build",
   "coverage",
   ".next",
+  ".nx",
   ".turbo",
   ".cache",
+  ".omc",
+  ".jest-cache",
   ".venv",
   "venv",
   "target",
@@ -42,16 +46,66 @@ const DEFAULT_EXTENSIONS = new Set([
   ".sh",
 ]);
 
+const DEFAULT_MAX_FILE_BYTES = 1_500_000;
+const DEFAULT_MAX_CHUNKS = 10_000;
+const DEFAULT_MAX_TOTAL_CHARS = 20_000_000;
+
+function normalizePathForOutput(input: string): string {
+  return input.split(path.sep).join("/");
+}
+
+function loadGitIgnoredPrefixes(workspaceRoot: string): string[] {
+  try {
+    const repoRoot = execFileSync(
+      "git",
+      ["-C", workspaceRoot, "rev-parse", "--show-toplevel"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    if (!repoRoot) return [];
+
+    const output = execFileSync(
+      "git",
+      ["-C", workspaceRoot, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+
+    const repoRootAbs = path.resolve(repoRoot);
+    const workspaceRootAbs = path.resolve(workspaceRoot);
+    const prefixes = new Set<string>();
+    for (const rawLine of output.split(/\r?\n/)) {
+      const line = normalizePathForOutput(rawLine.trim()).replace(/\/$/, "");
+      if (!line) continue;
+      const candidateAbsPaths = [path.resolve(workspaceRootAbs, line), path.resolve(repoRootAbs, line)];
+      for (const candidateAbs of candidateAbsPaths) {
+        const rel = normalizePathForOutput(path.relative(workspaceRootAbs, candidateAbs)).replace(/\/$/, "");
+        if (!rel || rel === "." || rel.startsWith("..")) continue;
+        prefixes.add(rel);
+      }
+    }
+
+    return Array.from(prefixes).sort();
+  } catch {
+    return [];
+  }
+}
+
+function isGitIgnoredPath(relativePath: string, prefixes: string[]): boolean {
+  if (prefixes.length === 0) return false;
+  return prefixes.some((prefix) => relativePath === prefix || relativePath.startsWith(`${prefix}/`));
+}
+
 function collectFiles(args: {
   workspaceRoot: string;
   maxFiles: number;
   extensions?: Set<string>;
   includeGenerated?: boolean;
+  maxFileBytes: number;
 }): string[] {
   const root = path.resolve(args.workspaceRoot);
   const out: string[] = [];
   const queue: string[] = [root];
   const exts = args.extensions ?? DEFAULT_EXTENSIONS;
+  const gitIgnoredPrefixes = loadGitIgnoredPrefixes(root);
 
   while (queue.length > 0) {
     const current = queue.shift() as string;
@@ -73,6 +127,11 @@ function collectFiles(args: {
         continue;
       }
 
+      const relativePath = normalizePathForOutput(path.relative(root, fullPath));
+      if (isGitIgnoredPath(relativePath, gitIgnoredPrefixes)) {
+        continue;
+      }
+
       if (stats.isDirectory()) {
         if (entry === "generated" && args.includeGenerated) {
           queue.push(fullPath);
@@ -85,6 +144,7 @@ function collectFiles(args: {
 
       const ext = path.extname(entry).toLowerCase();
       if (!exts.has(ext)) continue;
+      if (stats.size > args.maxFileBytes) continue;
 
       out.push(fullPath);
       if (out.length >= args.maxFiles) return out;
@@ -170,17 +230,27 @@ export function buildRagIndex(args: {
   embeddingDims?: number;
   maxTermsPerChunk?: number;
   includeGenerated?: boolean;
+  maxFileBytes?: number;
+  maxChunks?: number;
+  maxTotalChars?: number;
 }): RagIndex {
   const workspaceRoot = path.resolve(args.workspaceRoot);
+  const maxFileBytes = Math.max(1, Math.trunc(args.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES));
+  const maxChunks = Math.max(1, Math.trunc(args.maxChunks ?? DEFAULT_MAX_CHUNKS));
+  const maxTotalChars = Math.max(1_000, Math.trunc(args.maxTotalChars ?? DEFAULT_MAX_TOTAL_CHARS));
   const files = collectFiles({
     workspaceRoot,
     maxFiles: args.maxFiles ?? 3000,
     includeGenerated: args.includeGenerated ?? false,
+    maxFileBytes,
   });
 
   const embeddingDims = Math.max(8, args.embeddingDims ?? 96);
   const chunks: RagChunk[] = [];
-  for (const filePath of files) {
+  let totalChars = 0;
+  let chunkBudgetReached = false;
+  outer: for (const filePath of files) {
+    if (chunkBudgetReached) break;
     const fileChunks = splitIntoChunks({
       filePath,
       workspaceRoot,
@@ -190,7 +260,17 @@ export function buildRagIndex(args: {
       maxTermsPerChunk: args.maxTermsPerChunk ?? 180,
     });
     for (const chunk of fileChunks) {
-      if (chunk.tokenCount > 0) chunks.push(chunk);
+      if (chunk.tokenCount <= 0) continue;
+      if (chunks.length >= maxChunks) {
+        chunkBudgetReached = true;
+        break outer;
+      }
+      if (totalChars + chunk.text.length > maxTotalChars) {
+        chunkBudgetReached = true;
+        break outer;
+      }
+      chunks.push(chunk);
+      totalChars += chunk.text.length;
     }
   }
 

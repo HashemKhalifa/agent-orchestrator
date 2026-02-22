@@ -1,0 +1,83 @@
+{
+  "id": "smoke-update-readme-task",
+  "version": "0.1.0",
+  "title": "Smoke: improve README quickstart section",
+  "description": "Scaffolded custom recipe. Replace placeholders with migration-specific details.",
+  "goalType": "custom",
+  "defaultWaveStrategy": "pilot_wave",
+  "preconditions": {
+    "packageManagers": [
+      "npm"
+    ],
+    "requiresFiles": [
+      "package.json"
+    ],
+    "requiresBuildTools": []
+  },
+  "discoverySources": [
+    {
+      "id": "scaffold-schema-guide",
+      "title": "Schema-Driven Recipe Authoring Guide",
+      "url": "https://json-schema.org/learn/getting-started-step-by-step",
+      "type": "curated_secondary",
+      "tags": [
+        "scaffold",
+        "recipe-authoring"
+      ]
+    }
+  ],
+  "riskProbes": [],
+  "steps": [
+    {
+      "id": "inventory",
+      "title": "Inventory current state",
+      "kind": "analyze",
+      "description": "Discover current implementation, configs, and ownership boundaries.",
+      "mutating": false
+    },
+    {
+      "id": "implement-migration",
+      "title": "Implement migration changes",
+      "kind": "transform",
+      "description": "Apply staged code/config changes for the target migration.",
+      "mutating": true
+    },
+    {
+      "id": "validate-parity",
+      "title": "Validate parity and stability",
+      "kind": "verify",
+      "description": "Run tests, typechecks, and smoke checks to validate behavior.",
+      "mutating": false
+    }
+  ],
+  "gates": [
+    {
+      "id": "gate-typecheck",
+      "title": "Typecheck passes",
+      "kind": "command",
+      "required": true,
+      "command": "npm run typecheck"
+    },
+    {
+      "id": "gate-tests",
+      "title": "Tests pass",
+      "kind": "command",
+      "required": true,
+      "command": "npm run test:run"
+    },
+    {
+      "id": "gate-risk-high",
+      "title": "No unresolved high/critical risks",
+      "kind": "risk",
+      "required": true,
+      "note": "Block apply when high/critical risks remain open."
+    }
+  ],
+  "rollbackHints": [
+    "Capture rollback checkpoints for each mutating wave."
+  ],
+  "edgeCases": [
+    "User provides recipe id that already exists in catalog.",
+    "Workspace has no package.json and inferred preconditions must fall back safely."
+  ]
+}

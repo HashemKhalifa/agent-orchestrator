@@ -73,6 +73,7 @@ bash scripts/run-bot-request-until-done.sh \
   --recipe-file recipes/backlog/03-recipe-init-scaffold.json \
   --provider-preset claude-timeboxed \
   --provider-timeout-ms 120000 \
+  --command-timeout-ms 150000 \
   --commit
 ```
 
@@ -111,6 +112,30 @@ npm --prefix packages/orchestrator-standalone run cli -- auto-run \
 
 `--executor-profile none` is required when using `--executor-provider custom`; otherwise the default profile command takes precedence.
 `ORCHESTRATOR_PROVIDER_HEARTBEAT_MS` controls periodic in-flight progress logs from timeboxed executors (default `10000`).
+`--command-timeout-ms` controls the outer DAG module timeout; if omitted in `run-bot-request-until-done.sh`, it auto-derives from `--provider-timeout-ms` (`provider + 30000ms`).
+`--analyze-timeout-ms` caps analyze/query module runtime (default: `min(command-timeout-ms, 45000)`), which keeps discovery/query phases from burning full provider budgets.
+`--resume-success-modules true` (default) reuses prior successful module artifacts when module inputs are unchanged, so retries focus on unresolved modules.
+Timeboxed executors run in strict non-interactive mode (no confirmation prompts; they should return concrete module evidence).
+`codex-timeboxed.sh` now defaults to low reasoning effort (`model_reasoning_effort="low"`) to reduce long-tail provider timeouts; override via `ORCHESTRATOR_CODEX_EXECUTABLE` when needed.
+
+Large monorepo recommendation:
+
+```bash
+ORCHESTRATOR_PM=pnpm \
+ORCHESTRATOR_CLAUDE_EXECUTABLE='claude -p --permission-mode bypassPermissions --effort low' \
+./scripts/run-bot-request-until-done.sh \
+  --goal-type build_migration \
+  --workspace-root /absolute/path/to/target-repo \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --provider-preset claude-timeboxed \
+  --provider-timeout-ms 120000 \
+  --command-timeout-ms 150000 \
+  --apply-mode dry-run \
+  --enable-critic \
+  --enable-repair-loop \
+  --max-parallel 4 \
+  --max-iterations 3
+```
 
 Template-style wrapper usage (recommended):
 
@@ -125,7 +150,17 @@ Template-style wrapper usage (recommended):
 Until-done loop progress line:
 - `progress=1:S>2:F>3:P...`: `S=success`, `F=failed`, `B=blocked`, `K=skipped`, `P=pending`.
 - `cursor=N/T next=<moduleId>`: next blocking step in full DAG order.
+- `topology=T across levels (a->b->c) startParallel=x maxParallel=y edges=l1->l2:n,...`: DAG level widths + inter-level dependency edge counts.
 - `note=stuck repeatFailureStreak=...`: same failure point repeated across iterations.
+- `memory=...`: repair-memory recall telemetry (calls/hits/resumed/selected/skipped).
+
+Runtime behavior notes:
+- Test impact gates run only for `implement` modules (not `analyze` modules).
+- In `targeted_then_full`, full-suite gate runs at checkpoint modules (gate/delivery sinks), not every module.
+- Analyze/query modules use a dedicated timeout budget (`--analyze-timeout-ms`) to avoid long discovery stalls.
+- Successful modules can be resumed from artifact contracts (`--resume-success-modules`) to speed iteration loops.
+- Timeboxed provider wrappers and until-done loop now terminate child process groups on timeout/interrupt to avoid orphan runs.
+- Wrapper hygiene cleanup only reaps orphaned (`ppid=1`) stale processes, so active runs are not terminated by sibling loops.
 
 ## Reference Projects (Not Dependencies)
 
@@ -259,6 +294,102 @@ bash scripts/run-bot-request-until-done.sh \
   --rag-replay-min-success-count 1
 ```
 
+RAG indexing and DAG workspace snapshots now honor `.gitignore` (including nested monorepo workspace roots), so cache/output folders such as `.nx` and `.jest-cache` are excluded automatically.
+
+Semantic and replay memory now persist as append-only event logs (`*.events.ndjson`) with periodic compaction into snapshot JSON files. This keeps large monorepo runs stable while preserving history for repair recall.
+
+`run-bot-request-until-done.sh` progress lines now include memory-revisit telemetry:
+- total memory calls
+- recall hits selected
+- candidates loaded by source
+- skipped reasons (for example threshold filtering or negative-memory blocking)
+
+Run against another project (Rsbuild example):
+
+```bash
+cd /Users/khalifah/workspace/H/orchestrator-core
+TARGET_REPO="/absolute/path/to/your-project"
+
+ORCHESTRATOR_PM=pnpm \
+ORCHESTRATOR_CLAUDE_EXECUTABLE='claude -p --permission-mode bypassPermissions --effort low' \
+./scripts/run-bot-request-until-done.sh \
+  --goal-type build_migration \
+  --workspace-root "$TARGET_REPO" \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --provider-preset claude-timeboxed \
+  --provider-timeout-ms 240000 \
+  --max-files 3000 \
+  --max-file-bytes 1500000 \
+  --max-chunks 10000 \
+  --max-total-chars 20000000 \
+  --apply-mode dry-run \
+  --enable-critic \
+  --enable-repair-loop \
+  --memory-revisit true \
+  --memory-revisit-max-calls-per-module 1 \
+  --memory-revisit-top-k 3 \
+  --memory-revisit-min-score 0 \
+  --test-impact targeted_then_full \
+  --full-test-command "pnpm -r test" \
+  --max-parallel 4 \
+  --max-repair-attempts 1 \
+  --max-total-attempts 120 \
+  --max-run-runtime-ms 3600000 \
+  --max-iterations 3 \
+  --sleep-seconds 2 \
+  --policy-pack security \
+  --policy-pack legal \
+  --policy-pack release \
+  --policy-pack infra \
+  --json-out generated/orchestration/autonomy/rsbuild-dryrun-summary.json
+```
+
+Promote to apply mode only after dry-run succeeds:
+
+```bash
+ORCHESTRATOR_PM=pnpm \
+ORCHESTRATOR_CLAUDE_EXECUTABLE='claude -p --permission-mode bypassPermissions --effort low' \
+./scripts/run-bot-request-until-done.sh \
+  --goal-type build_migration \
+  --workspace-root "$TARGET_REPO" \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --provider-preset claude-timeboxed \
+  --provider-timeout-ms 240000 \
+  --apply-mode apply \
+  --apply-guard-token ALLOW_APPLY \
+  --enable-critic \
+  --enable-repair-loop \
+  --max-total-attempts 120 \
+  --max-run-runtime-ms 3600000 \
+  --max-iterations 3 \
+  --json-out generated/orchestration/autonomy/rsbuild-apply-summary.json
+```
+
+Monitor this external run in the graph dashboard:
+
+`http://localhost:5178/?workspaceRoot=/absolute/path/to/your-project&autonomyDir=generated/orchestration/autonomy`
+
+If the UI still shows an old run, the workspace selector is pointed at a different repo.
+- Update `workspaceRoot` in the top control panel to your target repo.
+- Keep `autonomyDir` aligned with your run (usually `generated/orchestration/autonomy`).
+
+Memory hygiene (compaction + pruning):
+
+```bash
+pnpm --dir packages/orchestrator-standalone run cli -- memory-hygiene \
+  --workspace-root packages/orchestrator-standalone \
+  --autonomy-dir generated/orchestration/autonomy \
+  --memory-hygiene-max-entries 500 \
+  --memory-hygiene-max-age-days 180 \
+  --rag-replay-max-entries 240 \
+  --rag-replay-max-age-days 90 \
+  --json-out generated/orchestration/autonomy/memory-hygiene-summary.json
+```
+
+Path note:
+- If you pass `--workspace-root`, any relative `--recipe-file` path is resolved inside that workspace.
+- Using built-in `--recipe-id webpack-to-rsbuild-incremental` avoids accidental double-prefix path errors.
+
 One-shot intake (generate recipe + enqueue long-running worker job):
 
 ```bash
@@ -362,5 +493,4 @@ Core migration/orchestration skills are in `.codex/skills`, including:
 
 - Add benchmark baseline seeding from prior commits in CI (for immediate delta checks on fresh history).
 - Add richer policy critic parser macros (`{groupN}` expansion for more capture groups).
-- Add replay-memory compaction by semantic clustering to reduce near-duplicate query expansions.
 - Add signed artifact attestation for apply-mode evidence bundles.

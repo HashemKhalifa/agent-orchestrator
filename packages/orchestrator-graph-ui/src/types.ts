@@ -52,8 +52,20 @@ export interface RunTelemetry {
   totalTokensEffective: number | null;
   totalTokensEstimated: number | null;
   totalTokensObserved: number | null;
+  resumedModules: number;
   repairsGenerated: number;
   policyPackCount: number;
+  memoryCalls: number;
+  memoryHits: number;
+  memoryCandidatesLoaded: number;
+  memoryCandidatesSemantic: number;
+  memoryCandidatesReplay: number;
+  memoryCandidatesArtifact: number;
+  memorySelectedSemantic: number;
+  memorySelectedReplay: number;
+  memorySelectedArtifact: number;
+  memorySkippedTotal: number;
+  memorySkippedPreview: string | null;
   generatedAt: string | null;
 }
 

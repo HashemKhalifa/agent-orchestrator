@@ -24,12 +24,25 @@ export function InspectorPanel(props: InspectorPanelProps): JSX.Element {
       <section className="inspector-block">
         <h3>Telemetry</h3>
         <Field label="Attempts" value={String(props.runState?.telemetry?.totalAttempts ?? "-")} />
+        <Field label="Resumed" value={String(props.runState?.telemetry?.resumedModules ?? 0)} />
         <Field label="Elapsed" value={formatDuration(props.runState?.telemetry?.elapsedMs ?? undefined)} />
         <Field label="Total duration" value={formatDuration(props.runState?.telemetry?.totalDurationMs ?? undefined)} />
         <Field label="Avg/module" value={formatDuration(props.runState?.telemetry?.averageModuleDurationMs ?? undefined)} />
         <Field label="Longest module" value={formatDuration(props.runState?.telemetry?.longestModuleDurationMs ?? undefined)} />
         <Field label="Tokens effective" value={String(props.runState?.telemetry?.totalTokensEffective ?? "-")} />
         <Field label="Policy packs" value={String(props.runState?.telemetry?.policyPackCount ?? 0)} />
+        <Field label="Memory calls" value={String(props.runState?.telemetry?.memoryCalls ?? 0)} />
+        <Field label="Memory hits" value={String(props.runState?.telemetry?.memoryHits ?? 0)} />
+        <Field label="Memory loaded" value={String(props.runState?.telemetry?.memoryCandidatesLoaded ?? 0)} />
+        <Field
+          label="Memory sources"
+          value={`sem=${props.runState?.telemetry?.memoryCandidatesSemantic ?? 0}, replay=${props.runState?.telemetry?.memoryCandidatesReplay ?? 0}, artifact=${props.runState?.telemetry?.memoryCandidatesArtifact ?? 0}`}
+        />
+        <Field
+          label="Memory selected"
+          value={`sem=${props.runState?.telemetry?.memorySelectedSemantic ?? 0}, replay=${props.runState?.telemetry?.memorySelectedReplay ?? 0}, artifact=${props.runState?.telemetry?.memorySelectedArtifact ?? 0}`}
+        />
+        <Field label="Memory skipped" value={props.runState?.telemetry?.memorySkippedPreview ?? "-"} />
       </section>
 
       {!props.selected ? (

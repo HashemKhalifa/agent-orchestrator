@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   ExecutionRecipeSchema,
@@ -24,7 +24,8 @@ import { loadRagIndex, queryRagIndex } from "./rag/retriever.js";
 import { runAutoRefineQuery } from "./rag/refine.js";
 import { startRagServer } from "./rag/server.js";
 import { synthesizeTaskRequest } from "./autonomy/task-synthesizer.js";
-import { recordSemanticState } from "./autonomy/semantic-memory.js";
+import { compactSemanticMemory, recordSemanticState } from "./autonomy/semantic-memory.js";
+import { compactReplayMemory } from "./rag/replay-memory.js";
 import {
   cancelWorkerJob,
   defaultWorkerId,
@@ -53,6 +54,10 @@ function parseArgs(argv: string[]): ParsedArgs {
   let index = 0;
   while (index < argv.length) {
     const token = argv[index];
+    if (token === "--") {
+      index += 1;
+      continue;
+    }
     if (!token.startsWith("--")) {
       positionals.push(token);
       index += 1;
@@ -224,6 +229,7 @@ function printHelp(): void {
   process.stdout.write(`  dag-run --manifest <path> [options]\n`);
   process.stdout.write(`  skills-autogen --manifest <path> [options]\n`);
   process.stdout.write(`  auto-run --goal-type <type> --recipe-id <id> [options]\n\n`);
+  process.stdout.write(`  memory-hygiene [options]              Compact/prune semantic + replay memory state\n\n`);
   process.stdout.write(`  worker-enqueue --goal-type <type> --recipe-id <id> [options]\n`);
   process.stdout.write(`  worker-run [options]                  Run long-lived worker loop\n`);
   process.stdout.write(`  worker-status [options]               Inspect worker queue and heartbeat status\n\n`);
@@ -257,6 +263,9 @@ function printHelp(): void {
   process.stdout.write(`  --max-chars-per-chunk <n>    (rag-index; default: 5000)\n`);
   process.stdout.write(`  --embedding-dims <n>         (rag-index; default: 96)\n`);
   process.stdout.write(`  --max-terms-per-chunk <n>    (rag-index; default: 180)\n`);
+  process.stdout.write(`  --max-file-bytes <n>         (rag-index/auto-run; skip files larger than n bytes; default: 1500000)\n`);
+  process.stdout.write(`  --max-chunks <n>             (rag-index/auto-run; cap indexed chunks; default: 10000)\n`);
+  process.stdout.write(`  --max-total-chars <n>        (rag-index/auto-run; cap total indexed chunk chars; default: 20000000)\n`);
   process.stdout.write(`  --include-generated <bool>   (rag-index/auto-run; include generated/ dir; default: false)\n`);
   process.stdout.write(`  --bm25-weight <n>            (rag-query; default: 0.75)\n`);
   process.stdout.write(`  --embedding-weight <n>       (rag-query; default: 0.25)\n`);
@@ -293,12 +302,22 @@ function printHelp(): void {
   process.stdout.write(`  --fail-policy <graph|global> (default: graph)\n`);
   process.stdout.write(`  --fail-fast                  stop immediately on first failed/blocked module\n`);
   process.stdout.write(`  --timeout-ms <n>             command timeout (default: 600000; queued jobs default: 300000)\n`);
+  process.stdout.write(`  --analyze-timeout-ms <n>     cap analyze/query module timeout (default: min(timeout-ms, 45000))\n`);
+  process.stdout.write(`  --resume-success-modules <bool> reuse prior successful module artifacts when input digest matches (default: true)\n`);
   process.stdout.write(`  --enable-critic              run critic pass after each successful module command\n`);
   process.stdout.write(`  --critic-command <template>  critic command template with module placeholders\n`);
   process.stdout.write(`  --policy-critic-config <p>   JSON config for policy-pack critic templates/parsers\n`);
   process.stdout.write(`  --critic-fail-level <level>  info|warning|blocker threshold (default: blocker)\n`);
   process.stdout.write(`  --enable-repair-loop         auto-generate focused module repair task on failure\n`);
   process.stdout.write(`  --max-repair-attempts <n>    max focused repair attempts per module (default: 1)\n`);
+  process.stdout.write(`  --memory-revisit <bool>      enable recall from semantic/replay/artifact memory for repairs (default: true)\n`);
+  process.stdout.write(`  --memory-revisit-recipe-id <id> recipe id used to locate semantic/replay memory (defaults to current recipe in auto-run)\n`);
+  process.stdout.write(`  --memory-revisit-autonomy-dir <p> autonomy root for memory files (default: generated/orchestration/autonomy)\n`);
+  process.stdout.write(`  --memory-revisit-semantic-path <p> semantic memory path override\n`);
+  process.stdout.write(`  --memory-revisit-replay-path <p> replay memory path override\n`);
+  process.stdout.write(`  --memory-revisit-max-calls-per-module <n> max recall passes per module (default: 1)\n`);
+  process.stdout.write(`  --memory-revisit-top-k <n>   max recalled evidence items attached to repair task (default: 3)\n`);
+  process.stdout.write(`  --memory-revisit-min-score <n> minimum recall score threshold (default: 0)\n`);
   process.stdout.write(`  --max-total-attempts <n>     strict run budget for module attempts\n`);
   process.stdout.write(`  --max-total-tokens <n>       strict run budget for estimated token usage\n`);
   process.stdout.write(`  --max-run-runtime-ms <n>     strict run budget for elapsed runtime\n`);
@@ -307,6 +326,7 @@ function printHelp(): void {
   process.stdout.write(`  --no-require-artifact-contract disable required module artifact contract writes\n`);
   process.stdout.write(`  --test-impact <mode>         off|targeted|targeted_then_full\n`);
   process.stdout.write(`  --full-test-command <cmd>    full-suite command for targeted_then_full mode\n`);
+  process.stdout.write(`  --full-test-in-dry-run <bool> run full-suite gate in apply-mode dry-run (default: false)\n`);
   process.stdout.write(`  --canary-modules <n>         run canary checkpoint after N successful modules\n`);
   process.stdout.write(`  --canary-compare-command <c> command to compare metrics before full rollout\n`);
   process.stdout.write(`  --max-parallel <n>           max concurrent modules per level (default: 1)\n`);
@@ -344,6 +364,9 @@ function printHelp(): void {
   process.stdout.write(`  --base-recipe-id <id>        (recipe-generate; seed from existing recipe)\n`);
   process.stdout.write(`  --semantic-memory-path <p>   semantic memory state path override\n`);
   process.stdout.write(`  --no-semantic-memory         disable semantic memory persistence for auto-run\n`);
+  process.stdout.write(`  --memory-hygiene-max-entries <n> (memory-hygiene; semantic max entries; default: 500)\n`);
+  process.stdout.write(`  --memory-hygiene-max-age-days <n> (memory-hygiene; semantic max age in days; default: 180)\n`);
+  process.stdout.write(`  --memory-hygiene-scan <bool> (memory-hygiene; compact every memory file under autonomy dir; default: true)\n`);
   process.stdout.write(`  --include-internet <bool>    (recipe-generate; default: true)\n`);
   process.stdout.write(`  --fixtures-dir <path>        (eval-golden fixtures root)\n`);
   process.stdout.write(`  --allow-failed true          (eval-golden: do not throw on failures)\n`);
@@ -876,6 +899,9 @@ const AUTO_RUN_ALLOWED_KEYS = new Set([
   "auto-recipe-id",
   "recipe-output",
   "max-files",
+  "max-file-bytes",
+  "max-chunks",
+  "max-total-chars",
   "include-generated",
   "max-tasks",
   "executor",
@@ -902,6 +928,14 @@ const AUTO_RUN_ALLOWED_KEYS = new Set([
   "critic-fail-level",
   "enable-repair-loop",
   "max-repair-attempts",
+  "memory-revisit",
+  "memory-revisit-recipe-id",
+  "memory-revisit-autonomy-dir",
+  "memory-revisit-semantic-path",
+  "memory-revisit-replay-path",
+  "memory-revisit-max-calls-per-module",
+  "memory-revisit-top-k",
+  "memory-revisit-min-score",
   "max-total-attempts",
   "max-total-tokens",
   "max-run-runtime-ms",
@@ -910,6 +944,7 @@ const AUTO_RUN_ALLOWED_KEYS = new Set([
   "no-require-artifact-contract",
   "test-impact",
   "full-test-command",
+  "full-test-in-dry-run",
   "canary-modules",
   "canary-compare-command",
   "dependency",
@@ -1098,6 +1133,9 @@ async function commandRagIndex(args: ParsedArgs): Promise<void> {
     maxCharsPerChunk: parseNumber(args, "max-chars-per-chunk", 5000),
     embeddingDims: parseNumber(args, "embedding-dims", 96),
     maxTermsPerChunk: parseNumber(args, "max-terms-per-chunk", 180),
+    maxFileBytes: parseNumber(args, "max-file-bytes", 1_500_000),
+    maxChunks: parseNumber(args, "max-chunks", 10_000),
+    maxTotalChars: parseNumber(args, "max-total-chars", 20_000_000),
     includeGenerated: option(args, "include-generated", "false") === "true",
   });
 
@@ -1313,14 +1351,24 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     failPolicy: failPolicyRaw,
     failFast: flag(args, "fail-fast"),
     timeoutMs,
+    analyzeTimeoutMs: parseOptionalNumber(args, "analyze-timeout-ms"),
     outputPath: option(args, "json-out"),
     dryRun: flag(args, "dry-run"),
+    resumeSuccessModules: option(args, "resume-success-modules", "true") !== "false",
     enableCritic: flag(args, "enable-critic"),
     criticCommandTemplate: option(args, "critic-command"),
     policyCriticConfigPath: option(args, "policy-critic-config"),
     criticFailLevel: option(args, "critic-fail-level") as "info" | "warning" | "blocker" | undefined,
     enableRepairLoop: flag(args, "enable-repair-loop"),
     maxRepairAttempts: parseNumber(args, "max-repair-attempts", 1),
+    memoryRevisitEnabled: option(args, "memory-revisit", "true") !== "false",
+    memoryRevisitRecipeId: option(args, "memory-revisit-recipe-id"),
+    memoryRevisitAutonomyDir: option(args, "memory-revisit-autonomy-dir"),
+    memoryRevisitSemanticMemoryPath: option(args, "memory-revisit-semantic-path"),
+    memoryRevisitReplayMemoryPath: option(args, "memory-revisit-replay-path"),
+    memoryRevisitMaxCallsPerModule: parseNumber(args, "memory-revisit-max-calls-per-module", 1),
+    memoryRevisitTopK: parseNumber(args, "memory-revisit-top-k", 3),
+    memoryRevisitMinScore: parseNumber(args, "memory-revisit-min-score", 0),
     maxTotalAttempts: parseNumber(args, "max-total-attempts", 0),
     maxTotalTokens: parseNumber(args, "max-total-tokens", 0),
     maxRunDurationMs: parseNumber(args, "max-run-runtime-ms", 0),
@@ -1329,6 +1377,7 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     requireArtifactContract: flag(args, "no-require-artifact-contract") ? false : undefined,
     testImpactMode,
     fullTestCommand: option(args, "full-test-command"),
+    fullTestInDryRun: option(args, "full-test-in-dry-run", "false") === "true",
     canaryLimitModules: parseNumber(args, "canary-modules", 0),
     canaryCompareCommand: option(args, "canary-compare-command"),
     maxParallel: parseNumber(args, "max-parallel", 1),
@@ -1359,6 +1408,181 @@ async function commandSkillsAutogen(args: ParsedArgs): Promise<void> {
   });
 
   writeJson(option(args, "json-out"), result, workspaceRoot);
+}
+
+async function commandMemoryHygiene(args: ParsedArgs): Promise<void> {
+  const workspaceRoot = path.resolve(option(args, "workspace-root", defaultWorkspaceRoot()) as string);
+  const autonomyDir = option(args, "autonomy-dir", "generated/orchestration/autonomy") as string;
+  const autonomyDirAbs = path.isAbsolute(autonomyDir) ? path.resolve(autonomyDir) : path.resolve(workspaceRoot, autonomyDir);
+  const recipeIdOverride = option(args, "recipe-id");
+  const policyPacks = optionList(args, "policy-pack");
+  const semanticMemoryPathOverride = option(args, "semantic-memory-path");
+  const replayMemoryPathOverride = option(args, "rag-replay-memory-path");
+  const runScan = option(args, "memory-hygiene-scan", "true") !== "false";
+  const semanticMaxEntries = parseNumber(args, "memory-hygiene-max-entries", 500);
+  const semanticMaxAgeDays = parseNumber(args, "memory-hygiene-max-age-days", 180);
+  const replayMaxEntries = parseNumber(args, "rag-replay-max-entries", 240);
+  const replayMaxAgeDays = parseNumber(args, "rag-replay-max-age-days", 90);
+  const replayMinScore = parseNumber(args, "rag-replay-min-score", 0);
+  const replayMinSuccessCount = parseNumber(args, "rag-replay-min-success-count", 1);
+
+  const toPortable = (input: string): string => path.relative(workspaceRoot, input).replace(/\\/g, "/");
+  const safeRecipeId = (filePath: string): string | null => {
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { recipeId?: unknown };
+      return typeof parsed.recipeId === "string" && parsed.recipeId.trim().length > 0
+        ? parsed.recipeId.trim()
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const listJsonFiles = (dirPath: string): string[] => {
+    if (!existsSync(dirPath)) return [];
+    try {
+      return readdirSync(dirPath)
+        .filter((entry) => entry.endsWith(".json"))
+        .map((entry) => path.resolve(dirPath, entry))
+        .sort((a, b) => a.localeCompare(b));
+    } catch {
+      return [];
+    }
+  };
+
+  const semanticTargets = runScan
+    ? listJsonFiles(path.resolve(autonomyDirAbs, "memory"))
+    : (semanticMemoryPathOverride
+      ? [path.resolve(workspaceRoot, semanticMemoryPathOverride)]
+      : []);
+  const replayTargets = runScan
+    ? listJsonFiles(path.resolve(autonomyDirAbs, "rag", "replay"))
+    : (replayMemoryPathOverride
+      ? [path.resolve(workspaceRoot, replayMemoryPathOverride)]
+      : []);
+
+  const semanticResults: Array<{
+    path: string;
+    recipeId: string;
+    before: { decisions: number; failedAttempts: number; mitigations: number; pendingEventCount: number };
+    after: { decisions: number; failedAttempts: number; mitigations: number; pendingEventCount: number };
+    compacted: boolean;
+  }> = [];
+  const replayResults: Array<{
+    path: string;
+    recipeId: string;
+    before: { entryCount: number; pendingEventCount: number };
+    after: { entryCount: number; pendingEventCount: number };
+    compacted: boolean;
+  }> = [];
+  const errors: string[] = [];
+
+  const runSemanticCompaction = (filePath: string | undefined, recipeId: string) => {
+    const compacted = compactSemanticMemory({
+      workspaceRoot,
+      recipeId,
+      policyPacks,
+      autonomyDir,
+      memoryPath: filePath,
+      maxEntries: semanticMaxEntries,
+      maxAgeDays: semanticMaxAgeDays,
+    });
+    semanticResults.push({
+      path: toPortable(compacted.memoryPath),
+      recipeId,
+      before: compacted.before,
+      after: compacted.after,
+      compacted:
+        compacted.before.pendingEventCount > 0 ||
+        compacted.before.decisions !== compacted.after.decisions ||
+        compacted.before.failedAttempts !== compacted.after.failedAttempts ||
+        compacted.before.mitigations !== compacted.after.mitigations,
+    });
+  };
+
+  const runReplayCompaction = (filePath: string | undefined, recipeId: string) => {
+    const compacted = compactReplayMemory({
+      workspaceRoot,
+      recipeId,
+      autonomyDir,
+      memoryPath: filePath,
+      retentionMaxEntries: replayMaxEntries,
+      retentionMaxAgeDays: replayMaxAgeDays,
+      retentionMinScore: replayMinScore,
+      retentionMinSuccessCount: replayMinSuccessCount,
+    });
+    replayResults.push({
+      path: toPortable(compacted.memoryPath),
+      recipeId,
+      before: compacted.before,
+      after: compacted.after,
+      compacted:
+        compacted.before.pendingEventCount > 0 ||
+        compacted.before.entryCount !== compacted.after.entryCount,
+    });
+  };
+
+  for (const filePath of semanticTargets) {
+    const recipeId = recipeIdOverride ?? safeRecipeId(filePath);
+    if (!recipeId) {
+      errors.push(`semantic memory skipped (missing recipeId): ${toPortable(filePath)}`);
+      continue;
+    }
+    try {
+      runSemanticCompaction(filePath, recipeId);
+    } catch (error) {
+      errors.push(`semantic memory failed (${toPortable(filePath)}): ${(error as Error).message}`);
+    }
+  }
+
+  for (const filePath of replayTargets) {
+    const recipeId = recipeIdOverride ?? safeRecipeId(filePath);
+    if (!recipeId) {
+      errors.push(`replay memory skipped (missing recipeId): ${toPortable(filePath)}`);
+      continue;
+    }
+    try {
+      runReplayCompaction(filePath, recipeId);
+    } catch (error) {
+      errors.push(`replay memory failed (${toPortable(filePath)}): ${(error as Error).message}`);
+    }
+  }
+
+  if (!runScan && semanticTargets.length === 0 && replayTargets.length === 0 && recipeIdOverride) {
+    try {
+      runSemanticCompaction(
+        semanticMemoryPathOverride ? path.resolve(workspaceRoot, semanticMemoryPathOverride) : undefined,
+        recipeIdOverride,
+      );
+    } catch (error) {
+      errors.push(`semantic memory failed (default): ${(error as Error).message}`);
+    }
+    try {
+      runReplayCompaction(
+        replayMemoryPathOverride ? path.resolve(workspaceRoot, replayMemoryPathOverride) : undefined,
+        recipeIdOverride,
+      );
+    } catch (error) {
+      errors.push(`replay memory failed (default): ${(error as Error).message}`);
+    }
+  }
+
+  writeJson(option(args, "json-out"), {
+    workspaceRoot,
+    autonomyDir: path.relative(workspaceRoot, autonomyDirAbs).replace(/\\/g, "/"),
+    scanMode: runScan ? "scan" : "targeted",
+    semantic: {
+      processed: semanticResults.length,
+      compacted: semanticResults.filter((item) => item.compacted).length,
+      files: semanticResults,
+    },
+    replay: {
+      processed: replayResults.length,
+      compacted: replayResults.filter((item) => item.compacted).length,
+      files: replayResults,
+    },
+    errors,
+    generatedAt: new Date().toISOString(),
+  }, workspaceRoot);
 }
 
 async function commandAutoRun(args: ParsedArgs): Promise<void> {
@@ -1441,6 +1665,9 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
   const ragIndex = buildRagIndex({
     workspaceRoot,
     maxFiles: parseNumber(args, "max-files", 3000),
+    maxFileBytes: parseNumber(args, "max-file-bytes", 1_500_000),
+    maxChunks: parseNumber(args, "max-chunks", 10_000),
+    maxTotalChars: parseNumber(args, "max-total-chars", 20_000_000),
     includeGenerated: option(args, "include-generated", "false") === "true",
   });
   saveRagIndex({ index: ragIndex, outputPath: ragIndexPath });
@@ -1532,14 +1759,24 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     failPolicy: failPolicyRaw,
     failFast: flag(args, "fail-fast"),
     timeoutMs: parseNumber(args, "timeout-ms", 10 * 60 * 1000),
+    analyzeTimeoutMs: parseOptionalNumber(args, "analyze-timeout-ms"),
     outputPath: path.relative(workspaceRoot, dagRunSummaryPath),
     dryRun: flag(args, "dry-run"),
+    resumeSuccessModules: option(args, "resume-success-modules", "true") !== "false",
     enableCritic: flag(args, "enable-critic"),
     criticCommandTemplate: option(args, "critic-command"),
     policyCriticConfigPath: option(args, "policy-critic-config"),
     criticFailLevel: option(args, "critic-fail-level") as "info" | "warning" | "blocker" | undefined,
     enableRepairLoop: flag(args, "enable-repair-loop"),
     maxRepairAttempts: parseNumber(args, "max-repair-attempts", 1),
+    memoryRevisitEnabled: option(args, "memory-revisit", "true") !== "false",
+    memoryRevisitRecipeId: option(args, "memory-revisit-recipe-id", recipe.id),
+    memoryRevisitAutonomyDir: option(args, "memory-revisit-autonomy-dir", autonomyDir),
+    memoryRevisitSemanticMemoryPath: option(args, "memory-revisit-semantic-path", option(args, "semantic-memory-path")),
+    memoryRevisitReplayMemoryPath: option(args, "memory-revisit-replay-path", ragReplayMemoryPath),
+    memoryRevisitMaxCallsPerModule: parseNumber(args, "memory-revisit-max-calls-per-module", 1),
+    memoryRevisitTopK: parseNumber(args, "memory-revisit-top-k", 3),
+    memoryRevisitMinScore: parseNumber(args, "memory-revisit-min-score", 0),
     maxTotalAttempts: parseNumber(args, "max-total-attempts", 0),
     maxTotalTokens: parseNumber(args, "max-total-tokens", 0),
     maxRunDurationMs: parseNumber(args, "max-run-runtime-ms", 0),
@@ -1548,6 +1785,7 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     requireArtifactContract: flag(args, "no-require-artifact-contract") ? false : undefined,
     testImpactMode,
     fullTestCommand: option(args, "full-test-command"),
+    fullTestInDryRun: option(args, "full-test-in-dry-run", "false") === "true",
     canaryLimitModules: parseNumber(args, "canary-modules", 0),
     canaryCompareCommand: option(args, "canary-compare-command"),
     maxParallel: parseNumber(args, "max-parallel", 1),
@@ -1596,7 +1834,17 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
             failFast: flag(args, "fail-fast"),
             dependencyMode: option(args, "dependency", "staged"),
             maxParallel: parseNumber(args, "max-parallel", 1),
+            analyzeTimeoutMs: parseOptionalNumber(args, "analyze-timeout-ms") ?? null,
+            resumeSuccessModules: option(args, "resume-success-modules", "true") !== "false",
             testImpactMode,
+            memoryRevisitEnabled: option(args, "memory-revisit", "true") !== "false",
+            memoryRevisitRecipeId: option(args, "memory-revisit-recipe-id", recipe.id),
+            memoryRevisitAutonomyDir: option(args, "memory-revisit-autonomy-dir", autonomyDir),
+            memoryRevisitSemanticPath: option(args, "memory-revisit-semantic-path", option(args, "semantic-memory-path")),
+            memoryRevisitReplayPath: option(args, "memory-revisit-replay-path", ragReplayMemoryPath),
+            memoryRevisitMaxCallsPerModule: parseNumber(args, "memory-revisit-max-calls-per-module", 1),
+            memoryRevisitTopK: parseNumber(args, "memory-revisit-top-k", 3),
+            memoryRevisitMinScore: parseNumber(args, "memory-revisit-min-score", 0),
             ragAutoRefine,
             ragRefineIterations,
             ragRefineQueriesPerIteration,
@@ -1783,6 +2031,9 @@ async function main(): Promise<void> {
       return;
     case "auto-run":
       await commandAutoRun(parsed);
+      return;
+    case "memory-hygiene":
+      await commandMemoryHygiene(parsed);
       return;
     default:
       throw new Error(`Unknown command '${parsed.command}'. Use 'help'.`);

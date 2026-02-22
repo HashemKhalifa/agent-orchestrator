@@ -8,9 +8,12 @@ const DEFAULT_IGNORES = new Set([
   "dist",
   "build",
   "coverage",
+  ".jest-cache",
   ".next",
+  ".nx",
   ".turbo",
   ".cache",
+  ".omc",
 ]);
 
 interface PackageJsonShape {

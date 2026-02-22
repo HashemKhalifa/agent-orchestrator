@@ -9,6 +9,116 @@ Standalone recipe-driven orchestration engine for migration and refactor workflo
 - Deep discovery with local workspace analysis + internet evidence from docs/changelogs.
 - Strict blocker mode for unresolved breaking/memory/performance risks.
 
+## Quickstart
+
+Get running in under a minute. The CLI drives a full orchestration cycle — discovery, planning, validation, and execution — from a single recipe file. Each recipe defines what to migrate, what gates must pass, and what risks to probe.
+
+**Prerequisites**: Node.js >= 18 and npm.
+
+```bash
+# Clone and install
+git clone https://github.com/<org>/orchestrator-core.git
+cd orchestrator-core/packages/orchestrator-standalone
+npm install
+
+# Verify the setup
+npm run cli -- --help
+```
+
+A successful install prints the available commands: `auto-run`, `recipes`, `dag-run`, `dag-compile`, `discover`, `synthesize-tasks`, and more.
+
+> **Monorepo users**: run commands from the repo root with `npm --prefix packages/orchestrator-standalone run cli -- <command>`.
+>
+> **Tip**: `npm run cli` uses `tsx` to run TypeScript directly — no build step required.
+
+### 1. List and dry-run a built-in recipe
+
+```bash
+# See what's available
+npm run cli -- recipes
+# → webpack-to-rsbuild-incremental, react18-to-react19, jest-to-vitest, ...
+
+# Dry-run a recipe (read-only — no files are changed)
+npm run cli -- auto-run \
+  --goal-type build_migration \
+  --recipe-id webpack-to-rsbuild-incremental \
+  --apply-mode dry-run
+```
+
+This runs the full pipeline: discover → RAG retrieval → synthesize tasks → DAG compile → execute. Artifacts are written to `generated/orchestration/standalone/runs/<run-id>/`.
+
+### 2. Create your own recipe
+
+> See the [Recipe Authoring Guide](#recipe-authoring-guide) for the full schema reference and customization workflow.
+
+The fastest path is `recipe-intake`, which scaffolds a recipe and immediately enqueues a dry-run:
+
+```bash
+npm run cli -- recipe-intake \
+  --goal-type custom \
+  --recipe-id my-migration \
+  --title "My Migration" \
+  --description "Describe scope and risks" \
+  --workspace-root . \
+  --apply-mode dry-run
+```
+
+Or scaffold a recipe file first, then run it separately:
+
+```bash
+# Scaffold only
+npm run cli -- recipe-init \
+  --goal-type custom \
+  --recipe-id my-migration \
+  --title "My Migration" \
+  --description "Describe scope and risks" \
+  --workspace-root . \
+  --recipe-output recipes/backlog/my-migration.json
+
+# Run it
+npm run cli -- auto-run \
+  --goal-type custom \
+  --recipe-file recipes/backlog/my-migration.json \
+  --apply-mode dry-run
+```
+
+### 3. Promote to apply mode
+
+When dry-run results look correct, switch to apply mode. This requires an explicit guard token to prevent accidental mutations:
+
+```bash
+npm run cli -- auto-run \
+  --goal-type custom \
+  --recipe-file recipes/backlog/my-migration.json \
+  --apply-mode apply \
+  --apply-guard-token ALLOW_APPLY
+```
+
+Add `--enable-critic` and `--enable-repair-loop` for per-module quality checks with automatic retry on failure. Attach policy packs for domain-specific validation:
+
+```bash
+npm run cli -- auto-run \
+  --goal-type custom \
+  --recipe-file recipes/backlog/my-migration.json \
+  --apply-mode apply \
+  --apply-guard-token ALLOW_APPLY \
+  --enable-critic \
+  --enable-repair-loop \
+  --policy-pack security
+```
+
+Available packs: `security`, `legal`, `release`, `infra`. List them with `npm run cli -- policy-packs`.
+
+> **Monorepo users**: add `--prefix packages/orchestrator-standalone` to each `npm` command when running from the repo root.
+>
+> **Tip**: `npm run cli` uses `tsx` to run TypeScript directly — no build step required for development.
+
+### What's next
+
+- **Customize gates and risk probes** — see the [Recipe Authoring Guide](#recipe-authoring-guide) for schema details.
+- **Full CLI reference** — the [Commands](#commands) section lists every available subcommand.
+- **Advanced controls** — critic passes, repair loops, policy packs, and budget caps are covered in [Advanced Runtime Controls](#advanced-runtime-controls).
+
 ## Commands
 
 ```bash
@@ -184,6 +294,9 @@ npm --prefix packages/orchestrator-standalone run cli -- dag-run \
   --enable-critic \
   --critic-fail-level warning \
   --enable-repair-loop \
+  --memory-revisit true \
+  --memory-revisit-max-calls-per-module 1 \
+  --memory-revisit-top-k 3 \
   --max-total-attempts 200 \
   --max-total-tokens 250000 \
   --max-run-runtime-ms 1800000 \
@@ -192,6 +305,12 @@ npm --prefix packages/orchestrator-standalone run cli -- dag-run \
   --policy-pack security \
   --policy-critic-config .orchestrator/policy-critic.json
 ```
+
+Runtime behavior notes:
+- Test-impact gates execute only for `implement` modules.
+- `targeted_then_full` runs targeted package tests per module and reserves the full-suite command for gate/delivery checkpoint modules.
+- DAG runner caches gitignored prefixes per run and refreshes after module execution to keep snapshot diffs fast and gitignore-aware.
+- Timeboxed provider wrappers terminate child process groups on timeout/interrupt to prevent orphan provider jobs.
 
 ## Built-in Recipes (v1)
 
@@ -333,13 +452,34 @@ Artifacts per cycle:
 - Critic severity tiers with configurable threshold via `--critic-fail-level info|warning|blocker`.
 - Canary checkpoint via `--canary-modules` and `--canary-compare-command`.
 - Semantic run memory persisted by repo+recipe fingerprint during `auto-run`.
+- ReMem-style repair memory revisit (`--memory-revisit`) recalls prior decisions/failures/mitigations plus replay and artifact evidence into focused repair tasks.
+- Memory revisit ranking now blends token overlap, recency decay, accepted-mitigation boosts, and repeat-failure penalties.
+- Rejected mitigations are treated as negative memory and can be blocked from reuse when overlap is high.
 - Auto-refined RAG retrieval in `auto-run` / `synthesize-tasks` with critic convergence controls (bounded by iteration/query/runtime/token budgets).
 - Replay-memory query seeding persists successful refine expansions by repo+recipe fingerprint with retention caps (`--rag-replay-max-entries`, `--rag-replay-max-age-days`, `--rag-replay-min-score`, `--rag-replay-min-success-count`).
+- Semantic and replay memory persist as append-only event logs (`*.events.ndjson`) with periodic compaction to JSON snapshots.
 - `generated/` is excluded from RAG indexing by default, with opt-in override via `--include-generated true`.
+- RAG indexing and DAG workspace snapshots honor `.gitignore` (including nested workspace roots in monorepos) and skip common cache dirs like `.nx` and `.jest-cache`.
+- Large-repo RAG safety caps prevent oversized index serialization (`--max-file-bytes`, `--max-chunks`, `--max-total-chars`).
 - Token budgets prefer observed provider usage (including normalized wrapper token receipts) and fall back to estimates.
 - Benchmark trend thresholds can fail runs via `--benchmark-max-*-*` flags when deltas exceed budget.
 - Long-running worker orchestration via `worker-enqueue`/`worker-run`/`worker-status` plus operator controls `worker-cancel`/`worker-retry`, with persisted queue state, heartbeats, stale-run recovery, retry caps, and live-owner PID protection for long-running jobs.
 - Queued jobs default to `--timeout-ms 300000` (5 minutes); override per job when longer modules are expected.
+
+### Memory Hygiene
+
+Compact and prune semantic/replay memory in-place:
+
+```bash
+pnpm --dir packages/orchestrator-standalone run cli -- memory-hygiene \
+  --workspace-root packages/orchestrator-standalone \
+  --autonomy-dir generated/orchestration/autonomy \
+  --memory-hygiene-max-entries 500 \
+  --memory-hygiene-max-age-days 180 \
+  --rag-replay-max-entries 240 \
+  --rag-replay-max-age-days 90 \
+  --json-out generated/orchestration/autonomy/memory-hygiene-summary.json
+```
 
 ## Reference Inputs (Not Dependencies)
 
@@ -354,7 +494,6 @@ This package does not depend on these repositories at runtime.
 ## Recommended Next Additions
 
 - Add benchmark baseline seeding from prior commits in CI for immediate first-run delta checks.
-- Add replay-memory semantic deduplication for near-identical expansions.
 - Add artifact signing/attestation for apply evidence bundles.
 
 ## Notes
@@ -405,8 +544,15 @@ npm --prefix packages/orchestrator-standalone run cli -- auto-run \
 `scripts/run-bot-request-until-done.sh` supports `--commit` to create a git commit after successful completion (auto-generated commit message).
 
 `ORCHESTRATOR_PROVIDER_HEARTBEAT_MS` controls periodic in-flight progress logs from timeboxed executors (default `10000`).
+`run-bot-request-until-done.sh` also supports `--command-timeout-ms`; if omitted, it derives from `--provider-timeout-ms` (`provider + 30000ms`) to avoid long outer hangs.
+`--analyze-timeout-ms` caps analyze/query module runtime (default: `min(command-timeout-ms, 45000)`), so discovery/query stages do not consume full provider budgets.
+`--resume-success-modules true` (default) reuses successful module artifacts when module inputs are unchanged, reducing rerun cost across iterations.
+Wrapper hygiene cleanup only reaps orphaned (`ppid=1`) stale processes, preventing cross-run termination of active jobs.
+Timeboxed executors use strict non-interactive prompts (no approval questions; concrete module output required).
+`codex-timeboxed.sh` defaults to low reasoning effort (`model_reasoning_effort="low"`) to reduce timeout-heavy runs; override with `ORCHESTRATOR_CODEX_EXECUTABLE`.
 
 Until-done loop progress line:
 - `progress=1:S>2:F>3:P...`: `S=success`, `F=failed`, `B=blocked`, `K=skipped`, `P=pending`.
 - `cursor=N/T next=<moduleId>`: next blocking step in full DAG order.
+- `memory=... resumed=<n>`: repair-memory recall + resumed-module telemetry.
 - `note=stuck repeatFailureStreak=...`: same failure point repeated across iterations.

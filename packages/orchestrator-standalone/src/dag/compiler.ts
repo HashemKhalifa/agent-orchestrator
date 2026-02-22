@@ -86,6 +86,19 @@ function normalizeHeadingTitle(title: string): string {
 function classifyPart(title: string): PartKind {
   const t = normalizeHeadingTitle(title).toLowerCase();
 
+  if (/^iteration\s+\d+$/.test(t)) return "preamble";
+  if (
+    t.startsWith("query:") ||
+    t.startsWith("workspace snapshot") ||
+    t.startsWith("discovery evidence") ||
+    t.startsWith("rag evidence") ||
+    t.startsWith("auto-refine retrieval") ||
+    t.startsWith("refined top hits") ||
+    t.startsWith("implementation scope")
+  ) {
+    return "preamble";
+  }
+
   const preambleTitles = new Set([
     "objective",
     "non-negotiables",

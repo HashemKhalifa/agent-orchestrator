@@ -36,11 +36,19 @@ export const DagCriticFindingSchema = z.object({
   source: z.string().trim().min(1).default("critic"),
 });
 
+export const DagMemoryRevisitHitSchema = z.object({
+  source: z.enum(["semantic-memory", "replay-memory", "artifact-contract"]),
+  score: z.number().nonnegative(),
+  summary: z.string().trim().min(1),
+  reference: z.string().trim().min(1).nullable().default(null),
+});
+
 export const DagModuleArtifactSchema = z.object({
   moduleId: z.string().trim().min(1),
   generatedAt: z.string().trim().min(1),
   attempt: z.number().int().positive(),
   status: z.enum(["success", "failed", "blocked", "skipped"]),
+  inputDigest: z.string().trim().min(1).nullable().default(null),
   changedFiles: z.array(DagDiffFileSchema).default([]),
   command: DagCommandTraceSchema.nullable().default(null),
   critic: DagCommandTraceSchema.nullable().default(null),
@@ -49,6 +57,7 @@ export const DagModuleArtifactSchema = z.object({
   riskNotes: z.array(z.string()).default([]),
   policyPacks: z.array(z.string()).default([]),
   repairTaskPath: z.string().nullable().default(null),
+  memoryRevisit: z.array(DagMemoryRevisitHitSchema).default([]),
 });
 
 export const DagManifestSchema = z.object({
@@ -77,11 +86,13 @@ export const DagRunResultSchema = z.object({
   criticSeverity: DagCriticSeveritySchema.nullable().default(null),
   criticFindings: z.array(DagCriticFindingSchema).default([]),
   repairTaskPath: z.string().nullable().default(null),
+  memoryRevisit: z.array(DagMemoryRevisitHitSchema).default([]),
   testImpactCommands: z.array(z.string()).default([]),
   tokenAccountingMode: z.enum(["estimated", "observed", "mixed"]).default("estimated"),
   tokensObserved: z.number().int().nonnegative().default(0),
   tokensEstimated: z.number().int().nonnegative().default(0),
   tokensEffective: z.number().int().nonnegative().default(0),
+  resumedFromArtifact: z.boolean().default(false),
 });
 
 export const DagBudgetSnapshotSchema = z.object({
@@ -110,17 +121,61 @@ export const DagCanarySummarySchema = z.object({
   failureDetail: z.string().nullable(),
 });
 
+export const DagMemoryRevisitSummarySchema = z.object({
+  enabled: z.boolean(),
+  maxCallsPerModule: z.number().int().nonnegative(),
+  topK: z.number().int().positive(),
+  minScore: z.number().nonnegative(),
+  totalCalls: z.number().int().nonnegative(),
+  hitsUsed: z.number().int().nonnegative(),
+  candidatesLoadedBySource: z.object({
+    semanticMemory: z.number().int().nonnegative().default(0),
+    replayMemory: z.number().int().nonnegative().default(0),
+    artifactContract: z.number().int().nonnegative().default(0),
+  }).default({
+    semanticMemory: 0,
+    replayMemory: 0,
+    artifactContract: 0,
+  }),
+  selectedBySource: z.object({
+    semanticMemory: z.number().int().nonnegative().default(0),
+    replayMemory: z.number().int().nonnegative().default(0),
+    artifactContract: z.number().int().nonnegative().default(0),
+  }).default({
+    semanticMemory: 0,
+    replayMemory: 0,
+    artifactContract: 0,
+  }),
+  skippedByReason: z.object({
+    disabled: z.number().int().nonnegative().default(0),
+    maxCallsPerModule: z.number().int().nonnegative().default(0),
+    emptyQuery: z.number().int().nonnegative().default(0),
+    noCandidates: z.number().int().nonnegative().default(0),
+    negativeMemoryBlocked: z.number().int().nonnegative().default(0),
+    belowThreshold: z.number().int().nonnegative().default(0),
+  }).default({
+    disabled: 0,
+    maxCallsPerModule: 0,
+    emptyQuery: 0,
+    noCandidates: 0,
+    negativeMemoryBlocked: 0,
+    belowThreshold: 0,
+  }),
+});
+
 export const DagRunSummarySchema = z.object({
   manifestPath: z.string(),
   startedAt: z.string(),
   completedAt: z.string(),
   status: z.enum(["success", "partial_failure", "failure"]),
   results: z.array(DagRunResultSchema),
+  resumedModules: z.number().int().nonnegative().default(0),
   repairsGenerated: z.number().int().nonnegative().default(0),
   policyPacks: z.array(z.string()).default([]),
   artifactsDir: z.string().nullable().default(null),
   budget: DagBudgetSnapshotSchema.optional(),
   canary: DagCanarySummarySchema.optional(),
+  memoryRevisit: DagMemoryRevisitSummarySchema.optional(),
 });
 
 export type DagDependencyMode = z.infer<typeof DagDependencyModeSchema>;
@@ -129,11 +184,13 @@ export type DagDiffFile = z.infer<typeof DagDiffFileSchema>;
 export type DagCommandTrace = z.infer<typeof DagCommandTraceSchema>;
 export type DagCriticSeverity = z.infer<typeof DagCriticSeveritySchema>;
 export type DagCriticFinding = z.infer<typeof DagCriticFindingSchema>;
+export type DagMemoryRevisitHit = z.infer<typeof DagMemoryRevisitHitSchema>;
 export type DagModuleArtifact = z.infer<typeof DagModuleArtifactSchema>;
 export type DagManifest = z.infer<typeof DagManifestSchema>;
 export type DagRunResult = z.infer<typeof DagRunResultSchema>;
 export type DagBudgetSnapshot = z.infer<typeof DagBudgetSnapshotSchema>;
 export type DagCanarySummary = z.infer<typeof DagCanarySummarySchema>;
+export type DagMemoryRevisitSummary = z.infer<typeof DagMemoryRevisitSummarySchema>;
 export type DagRunSummary = z.infer<typeof DagRunSummarySchema>;
 
 export type SplitPart = {

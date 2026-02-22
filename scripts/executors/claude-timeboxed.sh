@@ -20,7 +20,13 @@ DAG module: $MODULE_ID
 Title: $TITLE
 Request path: $REQUEST_PATH
 Part file: $PART_FILE
-Execute the requested migration safely. Include commands and validation evidence.
+Run in strict non-interactive automation mode.
+- Do not ask questions or request confirmation.
+- Do not pause for human approval.
+- Execute only the scope defined in the part file.
+- If full implementation is risky, perform the safest concrete sub-steps (discovery, validation, scaffolding) and report exactly what was done.
+- Include commands run, files touched, and validation evidence.
+- End with one line: MODULE_STATUS: success or MODULE_STATUS: failed.
 PROMPT_EOF
 )
 
@@ -39,11 +45,11 @@ if command -v python3 >/dev/null 2>&1; then
   python3 - "$TIMEOUT_MS" "$HEARTBEAT_MS" "$MODULE_ID" "$CLAUDE_CMD" "$PROMPT" "$STDOUT_FILE" "$STDERR_FILE" <<'PY'
 import os
 import shlex
-import signal
 import subprocess
 import sys
 import time
 import selectors
+import signal
 
 timeout_ms = int(sys.argv[1])
 heartbeat_ms = int(sys.argv[2])
@@ -67,12 +73,38 @@ def write_chunk(stream, file_obj, chunk):
 
 with open(stdout_path, "wb") as stdout_f:
     with open(stderr_path, "wb") as stderr_f:
+        supports_process_groups = hasattr(os, "setsid")
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
+            preexec_fn=os.setsid if supports_process_groups else None,
         )
+
+        def terminate_tree(sig):
+            if proc.poll() is not None:
+                return
+            try:
+                if supports_process_groups:
+                    os.killpg(proc.pid, sig)
+                else:
+                    proc.send_signal(sig)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+        def handle_parent_signal(signum, _frame):
+            terminate_tree(signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                terminate_tree(signal.SIGKILL)
+            raise SystemExit(128 + int(signum))
+
+        for sig_name in ("SIGTERM", "SIGINT", "SIGHUP"):
+            if hasattr(signal, sig_name):
+                signal.signal(getattr(signal, sig_name), handle_parent_signal)
 
         for pipe in (proc.stdout, proc.stderr):
             if pipe is None:
@@ -89,26 +121,39 @@ with open(stdout_path, "wb") as stdout_f:
         deadline = started + timeout_s
         last_heartbeat = started
         timed_out = False
+        timed_out_at = None
 
         while True:
             now = time.monotonic()
             if proc.poll() is not None and len(selector.get_map()) == 0:
                 break
 
-            if proc.poll() is None and now >= deadline:
+            if proc.poll() is None and now >= deadline and not timed_out:
                 timed_out = True
+                timed_out_at = now
+                terminate_tree(signal.SIGTERM)
                 try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
+                    terminate_tree(signal.SIGKILL)
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
                         pass
-                    proc.wait()
+                # Do not wait for every pipe fd to close after timeout:
+                # some provider descendants can keep them open.
+                for pipe in (proc.stdout, proc.stderr):
+                    if pipe is None:
+                        continue
+                    try:
+                        selector.unregister(pipe)
+                    except Exception:
+                        pass
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+                break
 
             if now - last_heartbeat >= heartbeat_s and proc.poll() is None:
                 elapsed_s = int(now - started)
@@ -135,20 +180,24 @@ with open(stdout_path, "wb") as stdout_f:
 
                 write_chunk(stream, file_obj, chunk)
 
-        for pipe, file_obj, stream in (
-            (proc.stdout, stdout_f, sys.stdout),
-            (proc.stderr, stderr_f, sys.stderr),
-        ):
-            if pipe is None:
-                continue
-            while True:
-                try:
-                    chunk = os.read(pipe.fileno(), 4096)
-                except BlockingIOError:
-                    break
-                if not chunk:
-                    break
-                write_chunk(stream, file_obj, chunk)
+            if timed_out and timed_out_at is not None and now - timed_out_at > 3:
+                break
+
+        if not timed_out:
+            for pipe, file_obj, stream in (
+                (proc.stdout, stdout_f, sys.stdout),
+                (proc.stderr, stderr_f, sys.stderr),
+            ):
+                if pipe is None:
+                    continue
+                while True:
+                    try:
+                        chunk = os.read(pipe.fileno(), 4096)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    write_chunk(stream, file_obj, chunk)
 
         rc = proc.returncode if not timed_out else 124
 

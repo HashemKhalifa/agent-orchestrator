@@ -18,12 +18,17 @@ WAVE_STRATEGY=""
 DEPENDENCY_MODE="staged"
 MAX_TASKS=24
 MAX_FILES=3000
+MAX_FILE_BYTES=1500000
+MAX_CHUNKS=10000
+MAX_TOTAL_CHARS=20000000
 INCLUDE_GENERATED=false
 EXECUTOR_PROFILE="codex-safe"
 EXECUTOR_PROVIDER=""
 PROVIDER_TEMPLATE=""
 PROVIDER_PRESET=""
 PROVIDER_TIMEOUT_MS=""
+COMMAND_TIMEOUT_MS=""
+ANALYZE_TIMEOUT_MS=""
 EXECUTOR_TEMPLATE=""
 APPLY_MODE="dry-run"
 APPLY_GUARD_TOKEN=""
@@ -48,6 +53,14 @@ CRITIC_COMMAND=""
 POLICY_CRITIC_CONFIG=""
 CRITIC_FAIL_LEVEL="blocker"
 ENABLE_REPAIR_LOOP=true
+MEMORY_REVISIT=true
+MEMORY_REVISIT_RECIPE_ID=""
+MEMORY_REVISIT_AUTONOMY_DIR=""
+MEMORY_REVISIT_SEMANTIC_PATH=""
+MEMORY_REVISIT_REPLAY_PATH=""
+MEMORY_REVISIT_MAX_CALLS_PER_MODULE=1
+MEMORY_REVISIT_TOP_K=3
+MEMORY_REVISIT_MIN_SCORE=0
 MAX_REPAIR_ATTEMPTS=1
 MAX_TOTAL_ATTEMPTS=0
 MAX_TOTAL_TOKENS=0
@@ -58,9 +71,11 @@ REPAIRS_DIR=""
 REQUIRE_ARTIFACT_CONTRACT=true
 TEST_IMPACT_MODE="off"
 FULL_TEST_COMMAND=""
+FULL_TEST_IN_DRY_RUN=false
 CANARY_MODULES=0
 CANARY_COMPARE_COMMAND=""
 MAX_PARALLEL=1
+RESUME_SUCCESS_MODULES=true
 SEMANTIC_MEMORY=true
 SEMANTIC_MEMORY_PATH=""
 RAG_AUTO_REFINE=true
@@ -118,6 +133,63 @@ apply_provider_preset() {
   esac
 }
 
+cleanup_orphan_provider_processes() {
+  local killed=0
+  local pid=""
+  local cmd=""
+  local ppid=""
+  local etimes=""
+  local workspace_match=""
+  if [[ -n "${WORKSPACE_ROOT_ABS:-}" ]]; then
+    workspace_match="$WORKSPACE_ROOT_ABS"
+  fi
+
+  for pattern in 'claude -p .*DAG module:' 'codex .*DAG module:'; do
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+      [[ "$ppid" != "1" ]] && continue
+      etimes="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+      if [[ "$etimes" =~ ^[0-9]+$ ]] && [[ "$etimes" -lt 10 ]]; then
+        continue
+      fi
+      cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+      [[ "$cmd" != *"DAG module:"* ]] && continue
+      if [[ -n "$workspace_match" && "$cmd" != *"$workspace_match"* ]]; then
+        continue
+      fi
+      kill "$pid" 2>/dev/null || true
+      killed=$((killed + 1))
+    done < <(pgrep -f "$pattern" 2>/dev/null || true)
+  done
+
+  if [[ -n "$workspace_match" ]]; then
+    for pattern in \
+      "run-bot-request-until-done\\.sh .*--workspace-root ${workspace_match}" \
+      "src/cli\\.ts auto-run .*--workspace-root ${workspace_match}" \
+      "run cli auto-run .*--workspace-root ${workspace_match}"
+    do
+      while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        [[ "$pid" == "$$" ]] && continue
+        [[ "$pid" == "${BASHPID:-}" ]] && continue
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+        [[ "$ppid" != "1" ]] && continue
+        etimes="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+        if [[ "$etimes" =~ ^[0-9]+$ ]] && [[ "$etimes" -lt 10 ]]; then
+          continue
+        fi
+        kill "$pid" 2>/dev/null || true
+        killed=$((killed + 1))
+      done < <(pgrep -f "$pattern" 2>/dev/null || true)
+    done
+  fi
+
+  if [[ "$killed" -gt 0 ]]; then
+    echo "hygiene: terminated $killed stale orchestration/provider process(es)"
+  fi
+}
+
 print_help() {
   cat <<'USAGE'
 run-bot-request-until-done.sh
@@ -145,12 +217,17 @@ Planning/discovery options:
   --policy-pack <id>              Policy pack ids to inject (repeatable)
   --curated-domain <domain>       Curated source domain allowlist (repeatable)
   --max-files <n>                 RAG indexing cap (default: 3000)
+  --max-file-bytes <n>            Skip files larger than n bytes during RAG indexing (default: 1500000)
+  --max-chunks <n>                Cap indexed chunks to prevent oversized indices (default: 10000)
+  --max-total-chars <n>           Cap total indexed chunk characters (default: 20000000)
   --include-generated <bool>      Include generated/ dir in RAG index (default: false)
   --max-tasks <n>                 Max synthesized tasks (default: 24)
 
 Execution options:
   --provider-preset <preset>     codex|codex-timeboxed|claude|claude-subscription|claude-timeboxed|openai|anthropic
   --provider-timeout-ms <n>      Sets ORCHESTRATOR_PROVIDER_TIMEOUT_MS for timeboxed presets
+  --command-timeout-ms <n>       Command timeout for each module execution
+  --analyze-timeout-ms <n>       Cap analyze/query module timeout (default: min(command-timeout-ms, 45000))
   --claude-subscription          Alias for --provider-preset claude-subscription
   --executor-profile <profile>    none|codex-safe|claude-safe (default: codex-safe)
   --executor-provider <provider>  codex|claude|custom (optional)
@@ -171,6 +248,14 @@ Execution options:
   --policy-critic-config <path>   JSON config for policy-pack critic templates/parsers
   --critic-fail-level <level>     Critic threshold: info|warning|blocker (default: blocker)
   --disable-repair-loop           Disable focused repair loop
+  --memory-revisit <bool>         Enable repair-time memory recall (default: true)
+  --memory-revisit-recipe-id <id> Recipe id used to locate semantic/replay memory
+  --memory-revisit-autonomy-dir <path> Autonomy dir used for memory lookups
+  --memory-revisit-semantic-path <path> Semantic memory path override
+  --memory-revisit-replay-path <path> Replay memory path override
+  --memory-revisit-max-calls-per-module <n> Max recall calls per module (default: 1)
+  --memory-revisit-top-k <n>      Max recalled evidence items per repair task (default: 3)
+  --memory-revisit-min-score <n>  Minimum recall score threshold (default: 0)
   --max-repair-attempts <n>       Max focused repair attempts per module (default: 1)
   --max-total-attempts <n>        Run budget: max module attempts (0 disables)
   --max-total-tokens <n>          Run budget: max estimated token usage (0 disables)
@@ -180,9 +265,12 @@ Execution options:
   --no-require-artifact-contract  Disable strict artifact contract requirement
   --test-impact <mode>            off|targeted|targeted_then_full (default: off)
   --full-test-command <cmd>       Full-suite command for targeted_then_full
+  --full-test-in-dry-run <bool>   Enforce full-suite gate in apply-mode dry-run (default: false)
   --canary-modules <n>            Canary checkpoint after N successful modules
   --canary-compare-command <cmd>  Compare command before full rollout
   --max-parallel <n>              Max concurrent modules per DAG level (default: 1)
+  --resume-success-modules <bool> Reuse successful module artifacts when digest matches (default: true)
+  --no-resume-success-modules     Disable successful-module artifact resume
   --rag-auto-refine <bool>        Enable auto-refine retrieval in synthesis (default: true)
   --rag-refine-iterations <n>     Auto-refine max iterations (default: 3)
   --rag-refine-queries-per-iteration <n> Auto-refine max queries/iteration (default: 4)
@@ -211,6 +299,9 @@ Output options:
   --semantic-memory-path <path>   Semantic memory state path override
   --no-semantic-memory            Disable semantic memory persistence
   -h, --help                      Show help
+
+Runtime hygiene:
+  - Automatically terminates orphaned provider child processes (PPID=1) carrying DAG prompts before/after each iteration.
 USAGE
 }
 
@@ -276,6 +367,18 @@ while [[ $# -gt 0 ]]; do
       MAX_FILES="${2:-}"
       shift 2
       ;;
+    --max-file-bytes)
+      MAX_FILE_BYTES="${2:-}"
+      shift 2
+      ;;
+    --max-chunks)
+      MAX_CHUNKS="${2:-}"
+      shift 2
+      ;;
+    --max-total-chars)
+      MAX_TOTAL_CHARS="${2:-}"
+      shift 2
+      ;;
     --include-generated)
       INCLUDE_GENERATED="${2:-}"
       shift 2
@@ -291,6 +394,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --provider-timeout-ms)
       PROVIDER_TIMEOUT_MS="${2:-}"
+      shift 2
+      ;;
+    --command-timeout-ms)
+      COMMAND_TIMEOUT_MS="${2:-}"
+      shift 2
+      ;;
+    --analyze-timeout-ms)
+      ANALYZE_TIMEOUT_MS="${2:-}"
       shift 2
       ;;
     --claude-subscription)
@@ -378,6 +489,38 @@ while [[ $# -gt 0 ]]; do
       ENABLE_REPAIR_LOOP=true
       shift
       ;;
+    --memory-revisit)
+      MEMORY_REVISIT="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-recipe-id)
+      MEMORY_REVISIT_RECIPE_ID="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-autonomy-dir)
+      MEMORY_REVISIT_AUTONOMY_DIR="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-semantic-path)
+      MEMORY_REVISIT_SEMANTIC_PATH="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-replay-path)
+      MEMORY_REVISIT_REPLAY_PATH="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-max-calls-per-module)
+      MEMORY_REVISIT_MAX_CALLS_PER_MODULE="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-top-k)
+      MEMORY_REVISIT_TOP_K="${2:-}"
+      shift 2
+      ;;
+    --memory-revisit-min-score)
+      MEMORY_REVISIT_MIN_SCORE="${2:-}"
+      shift 2
+      ;;
     --max-repair-attempts)
       MAX_REPAIR_ATTEMPTS="${2:-}"
       shift 2
@@ -414,6 +557,10 @@ while [[ $# -gt 0 ]]; do
       FULL_TEST_COMMAND="${2:-}"
       shift 2
       ;;
+    --full-test-in-dry-run)
+      FULL_TEST_IN_DRY_RUN="${2:-}"
+      shift 2
+      ;;
     --canary-modules)
       CANARY_MODULES="${2:-}"
       shift 2
@@ -425,6 +572,14 @@ while [[ $# -gt 0 ]]; do
     --max-parallel)
       MAX_PARALLEL="${2:-}"
       shift 2
+      ;;
+    --resume-success-modules)
+      RESUME_SUCCESS_MODULES="${2:-}"
+      shift 2
+      ;;
+    --no-resume-success-modules)
+      RESUME_SUCCESS_MODULES=false
+      shift
       ;;
     --rag-auto-refine)
       RAG_AUTO_REFINE="${2:-}"
@@ -605,6 +760,21 @@ if [[ "$INCLUDE_GENERATED" != "true" && "$INCLUDE_GENERATED" != "false" ]]; then
   exit 1
 fi
 
+if [[ "$MEMORY_REVISIT" != "true" && "$MEMORY_REVISIT" != "false" ]]; then
+  echo "ERROR: --memory-revisit must be true or false" >&2
+  exit 1
+fi
+
+if [[ "$FULL_TEST_IN_DRY_RUN" != "true" && "$FULL_TEST_IN_DRY_RUN" != "false" ]]; then
+  echo "ERROR: --full-test-in-dry-run must be true or false" >&2
+  exit 1
+fi
+
+if [[ "$RESUME_SUCCESS_MODULES" != "true" && "$RESUME_SUCCESS_MODULES" != "false" ]]; then
+  echo "ERROR: --resume-success-modules must be true or false" >&2
+  exit 1
+fi
+
 validate_non_negative_int() {
   local value="$1"
   local flag_name="$2"
@@ -615,11 +785,16 @@ validate_non_negative_int() {
 }
 
 validate_non_negative_int "$MAX_REPAIR_ATTEMPTS" "max-repair-attempts"
+validate_non_negative_int "$MEMORY_REVISIT_MAX_CALLS_PER_MODULE" "memory-revisit-max-calls-per-module"
+validate_non_negative_int "$MEMORY_REVISIT_TOP_K" "memory-revisit-top-k"
 validate_non_negative_int "$MAX_TOTAL_ATTEMPTS" "max-total-attempts"
 validate_non_negative_int "$MAX_TOTAL_TOKENS" "max-total-tokens"
 validate_non_negative_int "$MAX_RUN_RUNTIME_MS" "max-run-runtime-ms"
 validate_non_negative_int "$CANARY_MODULES" "canary-modules"
 validate_non_negative_int "$MAX_PARALLEL" "max-parallel"
+validate_non_negative_int "$MAX_FILE_BYTES" "max-file-bytes"
+validate_non_negative_int "$MAX_CHUNKS" "max-chunks"
+validate_non_negative_int "$MAX_TOTAL_CHARS" "max-total-chars"
 validate_non_negative_int "$RAG_REFINE_ITERATIONS" "rag-refine-iterations"
 validate_non_negative_int "$RAG_REFINE_QUERIES_PER_ITERATION" "rag-refine-queries-per-iteration"
 validate_non_negative_int "$RAG_REFINE_QUERIES" "rag-refine-queries"
@@ -637,6 +812,36 @@ if [[ -n "$PROVIDER_TIMEOUT_MS" ]]; then
   fi
 fi
 
+if [[ -n "$COMMAND_TIMEOUT_MS" ]]; then
+  if ! [[ "$COMMAND_TIMEOUT_MS" =~ ^[0-9]+$ ]] || [[ "$COMMAND_TIMEOUT_MS" -lt 1000 ]]; then
+    echo "ERROR: --command-timeout-ms must be an integer >= 1000" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$ANALYZE_TIMEOUT_MS" ]]; then
+  if ! [[ "$ANALYZE_TIMEOUT_MS" =~ ^[0-9]+$ ]] || [[ "$ANALYZE_TIMEOUT_MS" -lt 1000 ]]; then
+    echo "ERROR: --analyze-timeout-ms must be an integer >= 1000" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "$COMMAND_TIMEOUT_MS" ]]; then
+  if [[ -n "$PROVIDER_TIMEOUT_MS" ]]; then
+    COMMAND_TIMEOUT_MS="$((PROVIDER_TIMEOUT_MS + 30000))"
+  else
+    COMMAND_TIMEOUT_MS=600000
+  fi
+fi
+
+if [[ -z "$ANALYZE_TIMEOUT_MS" ]]; then
+  if [[ "$COMMAND_TIMEOUT_MS" -lt 45000 ]]; then
+    ANALYZE_TIMEOUT_MS="$COMMAND_TIMEOUT_MS"
+  else
+    ANALYZE_TIMEOUT_MS=45000
+  fi
+fi
+
 if ! [[ "$RAG_REFINE_CONVERGENCE_EPSILON" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "ERROR: --rag-refine-convergence-epsilon must be a non-negative number" >&2
   exit 1
@@ -644,6 +849,11 @@ fi
 
 if ! [[ "$RAG_REPLAY_MIN_SCORE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "ERROR: --rag-replay-min-score must be a non-negative number" >&2
+  exit 1
+fi
+
+if ! [[ "$MEMORY_REVISIT_MIN_SCORE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "ERROR: --memory-revisit-min-score must be a non-negative number" >&2
   exit 1
 fi
 
@@ -664,10 +874,37 @@ LAST_CURSOR_STEP="0"
 LAST_TOTAL_MODULES="0"
 LAST_CURSOR_MODULE=""
 LAST_FLOW_PREVIEW=""
+LAST_RESUMED="0"
 PREV_FAILURE_SIGNATURE=""
 SAME_FAILURE_STREAK=0
+CURRENT_RUN_PID=""
+
+terminate_active_run() {
+  local pid="${CURRENT_RUN_PID:-}"
+  [[ -z "$pid" ]] && return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    if kill -0 "-$pid" 2>/dev/null; then
+      kill "-$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "-$pid" 2>/dev/null || true
+    fi
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  CURRENT_RUN_PID=""
+}
+
+on_exit() {
+  terminate_active_run || true
+  cleanup_orphan_provider_processes || true
+}
+
+trap on_exit EXIT INT TERM
 
 for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
+  cleanup_orphan_provider_processes
+
   ITER_SUMMARY="$AUTONOMY_DIR/iterations/auto-run-$(printf "%03d" "$iteration").json"
   LAST_SUMMARY="$ITER_SUMMARY"
 
@@ -680,18 +917,29 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
     --risk-gate-mode "$RISK_GATE_MODE"
     --dependency "$DEPENDENCY_MODE"
     --max-files "$MAX_FILES"
+    --max-file-bytes "$MAX_FILE_BYTES"
+    --max-chunks "$MAX_CHUNKS"
+    --max-total-chars "$MAX_TOTAL_CHARS"
     --include-generated "$INCLUDE_GENERATED"
     --max-tasks "$MAX_TASKS"
+    --timeout-ms "$COMMAND_TIMEOUT_MS"
+    --analyze-timeout-ms "$ANALYZE_TIMEOUT_MS"
     --executor-profile "$EXECUTOR_PROFILE"
     --apply-mode "$APPLY_MODE"
     --fail-policy "$FAIL_POLICY"
     --test-impact "$TEST_IMPACT_MODE"
+    --full-test-in-dry-run "$FULL_TEST_IN_DRY_RUN"
+    --memory-revisit "$MEMORY_REVISIT"
+    --memory-revisit-max-calls-per-module "$MEMORY_REVISIT_MAX_CALLS_PER_MODULE"
+    --memory-revisit-top-k "$MEMORY_REVISIT_TOP_K"
+    --memory-revisit-min-score "$MEMORY_REVISIT_MIN_SCORE"
     --max-repair-attempts "$MAX_REPAIR_ATTEMPTS"
     --max-total-attempts "$MAX_TOTAL_ATTEMPTS"
     --max-total-tokens "$MAX_TOTAL_TOKENS"
     --max-run-runtime-ms "$MAX_RUN_RUNTIME_MS"
     --canary-modules "$CANARY_MODULES"
     --max-parallel "$MAX_PARALLEL"
+    --resume-success-modules "$RESUME_SUCCESS_MODULES"
     --critic-fail-level "$CRITIC_FAIL_LEVEL"
     --rag-auto-refine "$RAG_AUTO_REFINE"
     --rag-refine-iterations "$RAG_REFINE_ITERATIONS"
@@ -816,6 +1064,22 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
     CMD+=(--rag-replay-memory-path "$RAG_REPLAY_MEMORY_PATH")
   fi
 
+  if [[ -n "$MEMORY_REVISIT_RECIPE_ID" ]]; then
+    CMD+=(--memory-revisit-recipe-id "$MEMORY_REVISIT_RECIPE_ID")
+  fi
+
+  if [[ -n "$MEMORY_REVISIT_AUTONOMY_DIR" ]]; then
+    CMD+=(--memory-revisit-autonomy-dir "$MEMORY_REVISIT_AUTONOMY_DIR")
+  fi
+
+  if [[ -n "$MEMORY_REVISIT_SEMANTIC_PATH" ]]; then
+    CMD+=(--memory-revisit-semantic-path "$MEMORY_REVISIT_SEMANTIC_PATH")
+  fi
+
+  if [[ -n "$MEMORY_REVISIT_REPLAY_PATH" ]]; then
+    CMD+=(--memory-revisit-replay-path "$MEMORY_REVISIT_REPLAY_PATH")
+  fi
+
   if ((${#CURATED_DOMAINS[@]:-0} > 0)); then
     for domain in "${CURATED_DOMAINS[@]}"; do
       CMD+=(--curated-domain "$domain")
@@ -839,6 +1103,7 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
   RECIPE_LABEL="${RECIPE_ID:-$RECIPE_FILE}"
   echo "==> [iteration $iteration/$MAX_ITERATIONS] auto-run for recipe '$RECIPE_LABEL'"
   ITERATION_STARTED_EPOCH="$(date +%s)"
+  ITERATION_STARTED_MS="$((ITERATION_STARTED_EPOCH * 1000))"
   LATEST_HEARTBEAT_ARTIFACT=""
   if [[ -n "$PROVIDER_TIMEOUT_MS" ]]; then
     ORCHESTRATOR_PROVIDER_TIMEOUT_MS="$PROVIDER_TIMEOUT_MS" "${CMD[@]}" &
@@ -847,6 +1112,7 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
   fi
 
   RUN_PID="$!"
+  CURRENT_RUN_PID="$RUN_PID"
 
   if [[ "$HEARTBEAT_SECONDS" -gt 0 ]]; then
     while kill -0 "$RUN_PID" 2>/dev/null; do
@@ -860,12 +1126,13 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
       HEARTBEAT_LINE="    heartbeat iteration=$iteration elapsed=${ELAPSED_SECONDS}s status=running"
 
       LATEST_ARTIFACT_FILE="$(
-        node - "$AUTONOMY_DIR_FS" "$WORKSPACE_ROOT_ABS" <<'NODE'
+        node - "$AUTONOMY_DIR_FS" "$WORKSPACE_ROOT_ABS" "$ITERATION_STARTED_MS" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 
 const autonomyDirFs = process.argv[2];
 const workspaceRootAbs = process.argv[3];
+const iterationStartedMs = Number(process.argv[4]) || 0;
 const roots = [
   path.resolve(autonomyDirFs, "dag", "artifacts"),
   path.resolve(workspaceRootAbs, "generated", "orchestration", "dag", "artifacts"),
@@ -893,6 +1160,7 @@ for (const root of roots) {
       continue;
     }
     const mtime = stats.mtimeMs || 0;
+    if (mtime < iterationStartedMs) continue;
     if (mtime > bestMtime) {
       bestMtime = mtime;
       bestPath = filePath;
@@ -938,6 +1206,9 @@ NODE
   wait "$RUN_PID"
   RUN_STATUS="$?"
   set -e
+  CURRENT_RUN_PID=""
+
+  cleanup_orphan_provider_processes
 
   if [[ "$RUN_STATUS" -ne 0 ]]; then
     echo "auto-run command failed with exit code $RUN_STATUS" >&2
@@ -973,16 +1244,46 @@ let success = 0;
 let skipped = 0;
 let results = [];
 let manifestModules = [];
+let levelWidthsPreview = "";
+let startParallel = 0;
+let maxParallel = 0;
+let levelEdgesPreview = "";
+let memoryCalls = 0;
+let memoryHits = 0;
+let memoryCandidatesLoaded = 0;
+let memorySelectedPreview = "";
+let memorySkippedPreview = "";
+let resumedModules = 0;
 
 if (dagRunSummaryPath && fs.existsSync(dagRunSummaryPath)) {
   const dagRun = JSON.parse(fs.readFileSync(dagRunSummaryPath, "utf8"));
   results = Array.isArray(dagRun.results) ? dagRun.results : [];
+  resumedModules = Number.isFinite(Number(dagRun.resumedModules)) ? Number(dagRun.resumedModules) : 0;
   for (const result of results) {
     if (result.status === "failed") failed.push(result.moduleId);
     else if (result.status === "blocked") blocked.push(result.moduleId);
     else if (result.status === "success") success += 1;
     else if (result.status === "skipped") skipped += 1;
   }
+
+  const memory = dagRun?.memoryRevisit ?? {};
+  memoryCalls = Number.isFinite(Number(memory.totalCalls)) ? Number(memory.totalCalls) : 0;
+  memoryHits = Number.isFinite(Number(memory.hitsUsed)) ? Number(memory.hitsUsed) : 0;
+  const candidates = memory?.candidatesLoadedBySource ?? {};
+  const selected = memory?.selectedBySource ?? {};
+  const skippedReasons = memory?.skippedByReason ?? {};
+  memoryCandidatesLoaded =
+    (Number(candidates.semanticMemory) || 0) +
+    (Number(candidates.replayMemory) || 0) +
+    (Number(candidates.artifactContract) || 0);
+  memorySelectedPreview = Object.entries(selected)
+    .filter(([, value]) => Number(value) > 0)
+    .map(([key, value]) => `${key}:${Number(value)}`)
+    .join(",");
+  memorySkippedPreview = Object.entries(skippedReasons)
+    .filter(([, value]) => Number(value) > 0)
+    .map(([key, value]) => `${key}:${Number(value)}`)
+    .join(",");
 }
 
 if (dagManifestPath && fs.existsSync(dagManifestPath)) {
@@ -991,6 +1292,52 @@ if (dagManifestPath && fs.existsSync(dagManifestPath)) {
   manifestModules = modules
     .map((module) => String(module?.id ?? ""))
     .filter((moduleId) => moduleId.length > 0);
+
+  const levelCounts = new Map();
+  const moduleLevel = new Map();
+  for (const module of modules) {
+    const moduleId = String(module?.id ?? "");
+    const levelRaw = Number(module?.level ?? 0);
+    const level = Number.isFinite(levelRaw) ? levelRaw : 0;
+    if (moduleId) moduleLevel.set(moduleId, level);
+    levelCounts.set(level, (levelCounts.get(level) ?? 0) + 1);
+  }
+  const sortedLevels = Array.from(levelCounts.keys()).sort((a, b) => a - b);
+  const widths = sortedLevels.map((level) => levelCounts.get(level) ?? 0);
+  if (widths.length > 0) {
+    levelWidthsPreview = widths.length <= 12
+      ? widths.join("->")
+      : `${widths.slice(0, 12).join("->")}->...`;
+    startParallel = widths[0] ?? 0;
+    maxParallel = Math.max(...widths);
+  }
+
+  const levelEdges = new Map();
+  for (const module of modules) {
+    const targetId = String(module?.id ?? "");
+    const targetLevel = moduleLevel.get(targetId);
+    const deps = Array.isArray(module?.dependsOn) ? module.dependsOn : [];
+    if (!targetId || targetLevel === undefined) continue;
+    for (const dep of deps) {
+      const depId = String(dep ?? "");
+      const depLevel = moduleLevel.get(depId);
+      if (depLevel === undefined) continue;
+      const key = `${depLevel}->${targetLevel}`;
+      levelEdges.set(key, (levelEdges.get(key) ?? 0) + 1);
+    }
+  }
+  const sortedEdgeEntries = Array.from(levelEdges.entries()).sort((a, b) => {
+    const [fromA, toA] = a[0].split("->").map((value) => Number(value));
+    const [fromB, toB] = b[0].split("->").map((value) => Number(value));
+    if (fromA !== fromB) return fromA - fromB;
+    return toA - toB;
+  });
+  if (sortedEdgeEntries.length > 0) {
+    const edgeTokens = sortedEdgeEntries.map(([key, count]) => `${key}:${count}`);
+    levelEdgesPreview = edgeTokens.length <= 12
+      ? edgeTokens.join(",")
+      : `${edgeTokens.slice(0, 12).join(",")},...`;
+  }
 }
 
 const done = dagStatus === "success" && failed.length === 0 && blocked.length === 0;
@@ -1041,12 +1388,22 @@ process.stdout.write(
     String(totalModules),
     cursorModule,
     flowPreview,
+    levelWidthsPreview,
+    String(startParallel),
+    String(maxParallel),
+    levelEdgesPreview,
+    String(memoryCalls),
+    String(memoryHits),
+    String(memoryCandidatesLoaded),
+    String(resumedModules),
+    memorySelectedPreview || "none",
+    memorySkippedPreview || "none",
   ].join("\u001f"),
 );
 NODE
   )"
 
-  IFS=$'\x1f' read -r DONE LAST_DAG_STATUS LAST_FAILED LAST_BLOCKED LAST_SUCCESS LAST_SKIPPED LAST_TASKS LAST_CURSOR_STEP LAST_TOTAL_MODULES LAST_CURSOR_MODULE LAST_FLOW_PREVIEW <<<"$STATUS_LINE"
+  IFS=$'\x1f' read -r DONE LAST_DAG_STATUS LAST_FAILED LAST_BLOCKED LAST_SUCCESS LAST_SKIPPED LAST_TASKS LAST_CURSOR_STEP LAST_TOTAL_MODULES LAST_CURSOR_MODULE LAST_FLOW_PREVIEW LAST_LEVEL_WIDTHS LAST_START_PARALLEL LAST_MAX_PARALLEL LAST_LEVEL_EDGES LAST_MEMORY_CALLS LAST_MEMORY_HITS LAST_MEMORY_CANDIDATES LAST_RESUMED LAST_MEMORY_SELECTED LAST_MEMORY_SKIPPED <<<"$STATUS_LINE"
 
   CURRENT_FAILURE_SIGNATURE="${LAST_FAILED}|${LAST_BLOCKED}|${LAST_CURSOR_STEP}"
   if [[ -n "$LAST_FAILED" || -n "$LAST_BLOCKED" ]]; then
@@ -1065,6 +1422,8 @@ NODE
   if [[ "${LAST_TOTAL_MODULES:-0}" =~ ^[0-9]+$ ]] && [[ "$LAST_TOTAL_MODULES" -gt 0 ]]; then
     NEXT_MODULE="${LAST_CURSOR_MODULE:-done}"
     echo "    progress=${LAST_FLOW_PREVIEW:-none} cursor=${LAST_CURSOR_STEP}/${LAST_TOTAL_MODULES} next=$NEXT_MODULE"
+    echo "    topology=${LAST_TOTAL_MODULES} across levels (${LAST_LEVEL_WIDTHS:-unknown}) startParallel=${LAST_START_PARALLEL:-0} maxParallel=${LAST_MAX_PARALLEL:-0} edges=${LAST_LEVEL_EDGES:-none}"
+    echo "    memory=calls=${LAST_MEMORY_CALLS:-0} hits=${LAST_MEMORY_HITS:-0} loaded=${LAST_MEMORY_CANDIDATES:-0} resumed=${LAST_RESUMED:-0} selected=${LAST_MEMORY_SELECTED:-none} skipped=${LAST_MEMORY_SKIPPED:-none}"
   else
     echo "    progress=none cursor=0/0 next=unknown"
   fi
