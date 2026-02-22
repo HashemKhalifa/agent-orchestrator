@@ -902,6 +902,49 @@ on_exit() {
 
 trap on_exit EXIT INT TERM
 
+emit_plan_preview() {
+  local manifest_path="$AUTONOMY_DIR_FS/dag/manifest.json"
+  local preview_line=""
+  preview_line="$(
+    node - "$manifest_path" "$DEPENDENCY_MODE" <<'NODE'
+const fs = require("node:fs");
+
+const manifestPath = process.argv[2];
+const dependencyMode = process.argv[3] || "staged";
+const phases = "discover>rag>synthesize>compile>execute";
+
+if (!fs.existsSync(manifestPath)) {
+  process.stdout.write(`${phases} (manifest:pending mode=${dependencyMode})`);
+  process.exit(0);
+}
+
+try {
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const modules = Array.isArray(manifest.modules) ? manifest.modules : [];
+  const levelCounts = new Map();
+  for (const module of modules) {
+    const levelRaw = Number(module?.level ?? 0);
+    const level = Number.isFinite(levelRaw) ? levelRaw : 0;
+    levelCounts.set(level, (levelCounts.get(level) ?? 0) + 1);
+  }
+  const levels = Array.from(levelCounts.keys()).sort((a, b) => a - b);
+  const widths = levels.map((level) => levelCounts.get(level) ?? 0);
+  const levelText = widths.length > 0
+    ? widths.map((width, idx) => `L${idx}(${width})`).join(" -> ")
+    : "none";
+  const startParallel = widths.length > 0 ? widths[0] : 0;
+  const maxParallel = widths.length > 0 ? Math.max(...widths) : 0;
+  process.stdout.write(
+    `${phases} | modules=${modules.length} | levels=${levelText} | startParallel=${startParallel} | maxParallel=${maxParallel} | mode=${manifest.dependencyMode ?? dependencyMode}`,
+  );
+} catch (_error) {
+  process.stdout.write(`${phases} (manifest:unreadable mode=${dependencyMode})`);
+}
+NODE
+  )"
+  echo "    planPreview=$preview_line"
+}
+
 for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
   cleanup_orphan_provider_processes
 
@@ -1102,6 +1145,7 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
 
   RECIPE_LABEL="${RECIPE_ID:-$RECIPE_FILE}"
   echo "==> [iteration $iteration/$MAX_ITERATIONS] auto-run for recipe '$RECIPE_LABEL'"
+  emit_plan_preview
   ITERATION_STARTED_EPOCH="$(date +%s)"
   ITERATION_STARTED_MS="$((ITERATION_STARTED_EPOCH * 1000))"
   LATEST_HEARTBEAT_ARTIFACT=""

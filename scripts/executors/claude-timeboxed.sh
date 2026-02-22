@@ -14,6 +14,74 @@ fi
 CLAUDE_CMD="${ORCHESTRATOR_CLAUDE_EXECUTABLE:-claude -p}"
 TIMEOUT_MS="${ORCHESTRATOR_PROVIDER_TIMEOUT_MS:-180000}"
 HEARTBEAT_MS="${ORCHESTRATOR_PROVIDER_HEARTBEAT_MS:-10000}"
+GATE_TIMEOUT_MS="${ORCHESTRATOR_PROVIDER_GATE_TIMEOUT_MS:-600000}"
+REPAIR_TIMEOUT_MS="${ORCHESTRATOR_PROVIDER_REPAIR_TIMEOUT_MS:-600000}"
+GATE_EFFORT="${ORCHESTRATOR_PROVIDER_GATE_EFFORT:-low}"
+REPAIR_EFFORT="${ORCHESTRATOR_PROVIDER_REPAIR_EFFORT:-medium}"
+
+normalize_int() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -gt 0 ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+clamp_timeout() {
+  local value="$1"
+  local cap="$2"
+  if [[ "$value" -gt "$cap" ]]; then
+    printf '%s\n' "$cap"
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+set_effort_flag() {
+  local cmd="$1"
+  local effort="$2"
+  local normalized=""
+  if [[ -z "$effort" ]]; then
+    printf '%s\n' "$cmd"
+    return
+  fi
+  normalized="$(printf '%s' "$cmd" | sed -E 's/[[:space:]]*--effort[[:space:]]+[A-Za-z0-9_-]+//g' | tr -s ' ')"
+  normalized="${normalized#"${normalized%%[![:space:]]*}"}"
+  normalized="${normalized%"${normalized##*[![:space:]]}"}"
+  printf '%s --effort %s\n' "$normalized" "$effort"
+}
+
+MODULE_HINT="$(printf '%s %s %s' "$MODULE_ID" "$TITLE" "$PART_FILE" | tr '[:upper:]' '[:lower:]')"
+IS_REPAIR=false
+IS_GATE=false
+if [[ "$MODULE_HINT" == *"/repairs/"* || "$MODULE_HINT" == *"(repair)"* ]]; then
+  IS_REPAIR=true
+fi
+if [[ "$MODULE_HINT" == *"-gate-"* || "$MODULE_HINT" == *"gate:"* || "$MODULE_HINT" == *" parity check"* || "$MODULE_HINT" == *" typecheck"* || "$MODULE_HINT" == *"task-04-parity-check"* ]]; then
+  IS_GATE=true
+fi
+
+TIMEOUT_MS="$(normalize_int "$TIMEOUT_MS" 180000)"
+HEARTBEAT_MS="$(normalize_int "$HEARTBEAT_MS" 10000)"
+GATE_TIMEOUT_MS="$(normalize_int "$GATE_TIMEOUT_MS" 600000)"
+REPAIR_TIMEOUT_MS="$(normalize_int "$REPAIR_TIMEOUT_MS" 600000)"
+
+if [[ "$IS_GATE" == "true" ]]; then
+  TIMEOUT_MS="$(clamp_timeout "$TIMEOUT_MS" "$GATE_TIMEOUT_MS")"
+fi
+if [[ "$IS_REPAIR" == "true" ]]; then
+  TIMEOUT_MS="$(clamp_timeout "$TIMEOUT_MS" "$REPAIR_TIMEOUT_MS")"
+fi
+
+if [[ "$IS_REPAIR" == "true" ]]; then
+  CLAUDE_CMD="$(set_effort_flag "$CLAUDE_CMD" "$REPAIR_EFFORT")"
+elif [[ "$IS_GATE" == "true" ]]; then
+  CLAUDE_CMD="$(set_effort_flag "$CLAUDE_CMD" "$GATE_EFFORT")"
+fi
+
+echo "[$MODULE_ID] executor-profile gate=$IS_GATE repair=$IS_REPAIR timeoutMs=$TIMEOUT_MS" >&2
 
 PROMPT=$(cat <<PROMPT_EOF
 DAG module: $MODULE_ID
