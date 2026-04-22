@@ -16,24 +16,36 @@ TIMEOUT_MS="${ORCHESTRATOR_PROVIDER_TIMEOUT_MS:-180000}"
 HEARTBEAT_MS="${ORCHESTRATOR_PROVIDER_HEARTBEAT_MS:-10000}"
 MAX_RETRIES="${ORCHESTRATOR_PROVIDER_MAX_RETRIES:-0}"
 RETRY_ATTEMPT="${ORCHESTRATOR_PROVIDER_RETRY_ATTEMPT:-0}"
+STATUS_TOKEN="${MODULE_ID//[^A-Za-z0-9]/_}_$$_$(date +%s)"
 
-PROMPT=$(cat <<PROMPT_EOF
-DAG module: $MODULE_ID
-Title: $TITLE
-Request path: $REQUEST_PATH
-Part file: $PART_FILE
-Run in strict non-interactive automation mode.
-- Do not ask questions or request confirmation.
-- Do not pause for human approval.
-- Execute only the scope defined in the part file.
-- Package manager rule: prefer pnpm for install/run/test commands when available in this workspace.
-- Keep execution tight: avoid broad repo-wide scans unless strictly required by the part file.
-- Prefer direct commands over exploratory analysis; finish within the command timeout budget.
-- If full implementation is risky, perform the safest concrete sub-steps (discovery, validation, scaffolding) and report exactly what was done.
-- Include commands run, files touched, and validation evidence.
-- End with one line: MODULE_STATUS: success or MODULE_STATUS: failed.
-PROMPT_EOF
-)
+# Build the provider prompt without an expanding heredoc so future prompt text
+# cannot accidentally trigger shell command substitution.
+printf -v PROMPT '%s\n' \
+  "DAG module: $MODULE_ID" \
+  "Title: $TITLE" \
+  "Request path: $REQUEST_PATH" \
+  "Part file: $PART_FILE" \
+  "Run in strict non-interactive automation mode." \
+  "- Do not ask questions or request confirmation." \
+  "- Do not pause for human approval." \
+  "- Execute only the scope defined in the part file." \
+  "- Package manager rule: prefer pnpm for install/run/test commands when available in this workspace." \
+  "- Keep execution tight: avoid broad repo-wide scans unless strictly required by the part file." \
+  "- Do not scan generated/ broadly. Only read the current part file, current repair file, and the current module's own artifact directory under generated/orchestration/... when needed for validation." \
+  "- Prefer direct commands over exploratory analysis; finish within the command timeout budget." \
+  "- If full implementation is risky, perform the safest concrete sub-steps (discovery, validation, scaffolding) and report exactly what was done." \
+  "- Do not spend module budget on non-blocking lint/style cleanup. If lint issues are not required by the part file or by a targeted validation command for this module, record them and defer them to the final validation wave." \
+  "- Do not print full diffs, full file contents, or long command output to stdout. If you need verbose output for your own verification, redirect it to a task-local log file and keep stdout quiet." \
+  "- Keep validation narrow: run at most two targeted validation commands for this module, redirect verbose output to task-local logs, and report only pass/fail plus log paths." \
+  "- If the scoped code changes are complete and the targeted validations have passed, stop immediately. Do not continue with extra repo inspection, broad git status/diff commands, or unrelated cleanup." \
+  "- Ignore unrelated dirty files and do not edit caches, generated plugin artifacts, or unrelated assets outside the step scope." \
+  "- Keep the final response compact. Do not print full diffs, file contents, or long code blocks." \
+  "- Summarize commands run, files touched, and validation evidence in plain text only." \
+  "- Keep the final response to at most 12 short lines before the module status." \
+  "- Do not print the module status marker anywhere except the final line." \
+  "- As soon as the work is complete and validations are recorded, immediately end with one exact line:" \
+  "- MODULE_STATUS[$STATUS_TOKEN]: success" \
+  "- or MODULE_STATUS[$STATUS_TOKEN]: failed"
 
 STDOUT_FILE="$(mktemp)"
 STDERR_FILE="$(mktemp)"
@@ -47,7 +59,7 @@ STREAMED_OUTPUT=false
 if command -v python3 >/dev/null 2>&1; then
   STREAMED_OUTPUT=true
   set +e
-  python3 - "$TIMEOUT_MS" "$HEARTBEAT_MS" "$MODULE_ID" "$CODEX_CMD" "$PROMPT" "$STDOUT_FILE" "$STDERR_FILE" <<'PY'
+  python3 - "$TIMEOUT_MS" "$HEARTBEAT_MS" "$MODULE_ID" "$CODEX_CMD" "$PROMPT" "$STDOUT_FILE" "$STDERR_FILE" "$STATUS_TOKEN" <<'PY'
 import os
 import re
 import shlex
@@ -64,11 +76,14 @@ command = sys.argv[4]
 prompt = sys.argv[5]
 stdout_path = sys.argv[6]
 stderr_path = sys.argv[7]
+status_token = sys.argv[8]
 
 argv = shlex.split(command) + [prompt]
 timeout_s = max(1, timeout_ms) / 1000.0
 heartbeat_s = max(0.5, heartbeat_ms / 1000.0)
-module_status_re = re.compile(r"(?im)^\s*MODULE_STATUS:\s*(success|failed)\s*$")
+module_status_re = re.compile(
+    rf"(?im)^\s*MODULE_STATUS\[{re.escape(status_token)}\]:\s*(success|failed)\s*$"
+)
 
 def write_chunk(stream, file_obj, chunk):
     if not chunk:

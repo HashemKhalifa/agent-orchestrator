@@ -410,27 +410,41 @@ function detectAutonomyRefusal(text: string): string | null {
   return null;
 }
 
-function parseModuleStatusMarker(text: string): "success" | "failed" | null {
+function parseModuleStatusMarker(
+  text: string,
+  options: { requireFinalLine?: boolean } = {},
+): "success" | "failed" | null {
   if (!text.trim()) return null;
-  const strictLinePattern = /^\s*MODULE_STATUS:\s*(success|failed)\s*$/gim;
-  let match: RegExpExecArray | null;
-  let last: "success" | "failed" | null = null;
-  while ((match = strictLinePattern.exec(text)) !== null) {
-    const value = String(match[1] ?? "").toLowerCase();
-    if (value === "success" || value === "failed") {
-      last = value;
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const parseLine = (line: string): "success" | "failed" | null => {
+    const strictMatch = /^MODULE_STATUS:\s*(success|failed)$/i.exec(line);
+    if (strictMatch) {
+      const value = String(strictMatch[1] ?? "").toLowerCase();
+      if (value === "success" || value === "failed") return value;
     }
-  }
-  if (last) return last;
 
-  const keyValuePattern = /\bmodule_status\s*[:=]\s*(success|failed)\b/gi;
-  while ((match = keyValuePattern.exec(text)) !== null) {
-    const value = String(match[1] ?? "").toLowerCase();
-    if (value === "success" || value === "failed") {
-      last = value;
+    const keyValueMatch = /^module_status\s*[:=]\s*(success|failed)$/i.exec(line);
+    if (keyValueMatch) {
+      const value = String(keyValueMatch[1] ?? "").toLowerCase();
+      if (value === "success" || value === "failed") return value;
     }
+
+    return null;
+  };
+
+  if (options.requireFinalLine) {
+    return parseLine(lines.at(-1) ?? "");
   }
-  return last;
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const parsed = parseLine(lines[index]);
+    if (parsed) return parsed;
+  }
+
+  return null;
 }
 
 function estimateTokens(value: string): number {
@@ -2807,7 +2821,10 @@ export async function runDag(args: {
       }
 
       let moduleStatusMarkerFallbackNote = "";
-      const moduleStatusMarker = parseModuleStatusMarker(`${commandResult.stdout}\n${commandResult.stderr}`);
+      const moduleStatusMarker =
+        commandResult.stdout.trim().length > 0
+          ? parseModuleStatusMarker(commandResult.stdout, { requireFinalLine: true })
+          : parseModuleStatusMarker(commandResult.stderr);
       if (!dryRun && commandResult.status === "failed" && commandResult.code === 124 && moduleStatusMarker === "success") {
         moduleStatusMarkerFallbackNote = "module-status-timeout-fallback applied (MODULE_STATUS: success)";
         commandResult = DagRunResultSchema.parse({

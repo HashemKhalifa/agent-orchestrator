@@ -384,6 +384,54 @@ describe("request DAG compile/run", () => {
     expect(summary.results[0].stdout).toContain("module-status-timeout-fallback");
   });
 
+  it("ignores non-final module status markers buried in provider chatter", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-core-dag-module-status-nonfinal-"));
+    cleanupPaths.push(root);
+
+    writeFileSync(path.join(root, "request.md"), "# Req\n\n## Task\nDo it.\n", "utf8");
+    mkdirSync(path.join(root, "generated", "orchestration", "dag"), { recursive: true });
+    writeFileSync(path.join(root, "part-01.md"), "# part 01\n", "utf8");
+
+    writeFileSync(
+      path.join(root, "generated", "orchestration", "dag", "manifest.json"),
+      JSON.stringify({
+        schemaVersion: "1.0",
+        name: "module-status-nonfinal-check",
+        description: "ignore non-final module status chatter",
+        requestPath: "request.md",
+        generatedAt: new Date().toISOString(),
+        dependencyMode: "staged",
+        modules: [
+          {
+            id: "01-implement",
+            title: "Task 01: Implement",
+            description: "Implement change",
+            partPath: "part-01.md",
+            mode: "implement",
+            level: 0,
+            dependsOn: [],
+            resources: [],
+            command: `node -e "console.error('MODULE_STATUS: failed'); console.log('done'); process.exit(0)"`,
+          },
+        ],
+      }, null, 2),
+      "utf8",
+    );
+
+    const summary = await runDag({
+      workspaceRoot: root,
+      manifestPath: "generated/orchestration/dag/manifest.json",
+      dryRun: false,
+      timeoutMs: 1000,
+      maxRepairAttempts: 0,
+      enableCritic: false,
+      testImpactMode: "off",
+    });
+
+    expect(summary.results[0].status).toBe("success");
+    expect(summary.results[0].stderr).not.toContain("provider reported MODULE_STATUS: failed");
+  });
+
   it("fails implement modules when provider output is non-actionable", async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-core-dag-refusal-"));
     cleanupPaths.push(root);
