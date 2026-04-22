@@ -20,6 +20,8 @@ You can also package `packages/orchestrator-standalone` and publish/install it a
 - `packages/orchestrator-graph-ui` - React DAG graph + inspector for live orchestration runs
 - `scripts/run-standalone-orchestrator-until-done.sh` - run-until-done controller
 - `scripts/run-bot-request-until-done.sh` - autonomous discovery -> RAG -> DAG -> execute loop
+- `scripts/run-migration-preset.sh` - one-command preset launcher for repeatable migration runs
+- `scripts/presets` - preset definitions (recipe + stable flag bundles)
 - `scripts/run-autonomy-worker.sh` - long-running queue worker (heartbeat + stale-run recovery)
 - `scripts/run-request-dag-with-provider.sh` - run DAG with provider presets (codex/claude/openai/anthropic)
 - `scripts/run-graph-ui.sh` - launch local graph dashboard (API + React app)
@@ -63,6 +65,16 @@ bash scripts/run-bot-request-until-done.sh \
   --executor-profile codex-safe \
   --apply-mode dry-run
 ```
+
+Preset launcher (recommended for repeatable runs):
+
+```bash
+./scripts/run-migration-preset.sh --list
+./scripts/run-migration-preset.sh react19-v2-dryrun \
+  --workspace-root /absolute/path/to/target-repo
+```
+
+`run-migration-preset.sh` defaults `ORCHESTRATOR_PM=pnpm` when the env var is unset.
 
 Commit after a successful run:
 

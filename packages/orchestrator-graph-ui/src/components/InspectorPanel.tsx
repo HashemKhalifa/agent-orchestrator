@@ -8,6 +8,7 @@ interface InspectorPanelProps {
 
 export function InspectorPanel(props: InspectorPanelProps): JSX.Element {
   const selectedDependencies = getDependencySummary(props.selected?.id ?? null, props.runState);
+  const blockingRationale = getBlockingRationale(props.selected?.id ?? null, props.runState);
 
   return (
     <aside className="inspector">
@@ -15,8 +16,13 @@ export function InspectorPanel(props: InspectorPanelProps): JSX.Element {
 
       <section className="inspector-block">
         <h3>Sources</h3>
+        <Field label="Graph mode" value={props.runState?.graphMode ?? "auto"} />
         <Field label="Manifest" value={props.runState?.sourcePaths.manifestPath ?? "-"} mono />
+        <Field label="Graph" value={props.runState?.sourcePaths.graphPath ?? "-"} mono />
         <Field label="Run summary" value={props.runState?.sourcePaths.runSummaryPath ?? "-"} mono />
+        <Field label="Run summary v2" value={props.runState?.sourcePaths.runSummaryV2Path ?? "-"} mono />
+        <Field label="Node state v2" value={props.runState?.sourcePaths.nodeStateV2Path ?? "-"} mono />
+        <Field label="Events" value={props.runState?.sourcePaths.eventsPath ?? "-"} mono />
         <Field label="Artifacts" value={props.runState?.sourcePaths.artifactsDir ?? "-"} mono />
         <Field label="Iteration" value={props.runState?.sourcePaths.iterationSummaryPath ?? "-"} mono />
       </section>
@@ -60,10 +66,14 @@ export function InspectorPanel(props: InspectorPanelProps): JSX.Element {
           </div>
 
           <Field label="Attempt" value={String(props.selected.attempt ?? "-")} />
+          <Field label="Node kind" value={props.selected.kind} />
+          <Field label="Entry group" value={props.selected.entryGroup ?? "-"} />
+          <Field label="Lock keys" value={props.selected.lockKeys.length > 0 ? props.selected.lockKeys.join(", ") : "none"} />
           <Field label="Exit code" value={props.selected.code == null ? "-" : String(props.selected.code)} />
           <Field label="Duration" value={formatDuration(props.selected.durationMs)} />
           <Field label="Depends on" value={props.selected.dependsOn.length > 0 ? props.selected.dependsOn.join(", ") : "none"} />
           <Field label="Dependents" value={selectedDependencies.downstream.length > 0 ? selectedDependencies.downstream.join(", ") : "none"} />
+          <Field label="Block rationale" value={blockingRationale ?? "-"} />
           <Field label="Changed files" value={String(props.selected.changedFilesCount ?? 0)} />
           <Field label="Risk notes" value={String(props.selected.riskNotesCount ?? 0)} />
           <Field label="Critic" value={props.selected.criticSeverity ?? "-"} />
@@ -136,4 +146,14 @@ function getDependencySummary(
     .map((edge) => edge.target)
     .sort((a, b) => a.localeCompare(b));
   return { upstream, downstream };
+}
+
+function getBlockingRationale(selectedNodeId: string | null, runState: RunStateResponse | null): string | null {
+  if (!selectedNodeId || !runState) return null;
+  const inbound = runState.edges
+    .filter((edge) => edge.target === selectedNodeId && edge.blocking)
+    .map((edge) => edge.rationale || edge.kind)
+    .filter((value, index, arr) => arr.indexOf(value) === index);
+  if (inbound.length === 0) return null;
+  return inbound.join("; ");
 }

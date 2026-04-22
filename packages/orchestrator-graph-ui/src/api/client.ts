@@ -3,11 +3,17 @@ import type { RunStateResponse } from "../types";
 export async function fetchRunState(args: {
   workspaceRoot: string;
   autonomyDir: string;
+  mode: "v1" | "v2" | "auto";
+  runId?: string;
 }): Promise<RunStateResponse> {
   const params = new URLSearchParams({
     workspaceRoot: args.workspaceRoot,
     autonomyDir: args.autonomyDir,
+    mode: args.mode,
   });
+  if (args.runId && args.runId.trim().length > 0) {
+    params.set("runId", args.runId.trim());
+  }
 
   const response = await fetch(`/api/run-state?${params.toString()}`);
   if (!response.ok) {
@@ -22,6 +28,8 @@ export function subscribeRunState(
   args: {
     workspaceRoot: string;
     autonomyDir: string;
+    mode: "v1" | "v2" | "auto";
+    runId?: string;
     intervalMs: number;
   },
   handlers: {
@@ -32,8 +40,12 @@ export function subscribeRunState(
   const params = new URLSearchParams({
     workspaceRoot: args.workspaceRoot,
     autonomyDir: args.autonomyDir,
+    mode: args.mode,
     intervalMs: String(Math.max(500, Math.round(args.intervalMs))),
   });
+  if (args.runId && args.runId.trim().length > 0) {
+    params.set("runId", args.runId.trim());
+  }
 
   const source = new EventSource(`/api/stream?${params.toString()}`);
 

@@ -25,6 +25,7 @@ interface GraphCanvasProps {
   highlightedEdgeIds: Set<string>;
   searchMatchedNodeIds: Set<string>;
   dimOutsidePath: boolean;
+  compactMode: boolean;
   onSelectNode: (nodeId: string | null) => void;
 }
 
@@ -41,6 +42,7 @@ export function GraphCanvas(props: GraphCanvasProps): JSX.Element {
       props.highlightedEdgeIds,
       props.searchMatchedNodeIds,
       props.dimOutsidePath,
+      props.compactMode,
     ],
   );
 
@@ -95,8 +97,10 @@ function buildGraph(args: GraphCanvasProps): { nodes: Array<Node<GraphNodeData>>
     acyclicer: "greedy",
   });
 
+  const nodeWidth = args.compactMode ? 214 : NODE_WIDTH;
+  const nodeHeight = args.compactMode ? 62 : NODE_HEIGHT;
   for (const module of args.nodes) {
-    graph.setNode(module.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+    graph.setNode(module.id, { width: nodeWidth, height: nodeHeight });
   }
   for (const edge of args.edges) {
     graph.setEdge(edge.source, edge.target);
@@ -118,14 +122,15 @@ function buildGraph(args: GraphCanvasProps): { nodes: Array<Node<GraphNodeData>>
       draggable: false,
       selectable: true,
       position: point
-        ? { x: point.x - NODE_WIDTH / 2, y: point.y - NODE_HEIGHT / 2 }
-        : { x: module.level * 360, y: index * (NODE_HEIGHT + 26) },
+        ? { x: point.x - nodeWidth / 2, y: point.y - nodeHeight / 2 }
+        : { x: module.level * 280, y: index * (nodeHeight + 18) },
       data: {
         module,
         emphasized: selected || emphasized,
         dimmed,
         pathRole: selected ? "selected" : pathRole,
         searchMatched: args.searchMatchedNodeIds.has(module.id),
+        compact: args.compactMode,
       },
     };
   });
@@ -133,6 +138,8 @@ function buildGraph(args: GraphCanvasProps): { nodes: Array<Node<GraphNodeData>>
   const edges: Edge[] = args.edges.map((edge) => {
     const highlighted = args.highlightedEdgeIds.has(edge.id);
     const muted = args.dimOutsidePath && hasPathHighlights && !highlighted;
+    const stroke = edgeStroke(edge.kind, highlighted);
+    const dashed = edge.kind === "soft_depends_on";
 
     return {
       id: edge.id,
@@ -143,11 +150,13 @@ function buildGraph(args: GraphCanvasProps): { nodes: Array<Node<GraphNodeData>>
         type: MarkerType.ArrowClosed,
         width: highlighted ? 14 : 12,
         height: highlighted ? 14 : 12,
+        color: stroke,
       },
       animated: highlighted,
       style: {
-        stroke: highlighted ? "rgba(142, 219, 255, 0.95)" : "rgba(127, 154, 196, 0.56)",
+        stroke,
         strokeWidth: highlighted ? 2.2 : 1.4,
+        strokeDasharray: dashed ? "6 5" : undefined,
         opacity: muted ? 0.2 : 0.95,
       },
     };
@@ -171,4 +180,12 @@ function resolvePathRole(
   const touchesInbound = edges.some((edge) => edge.source === moduleId && highlightedNodeIds.has(edge.target));
   if (touchesInbound) return "upstream";
   return "downstream";
+}
+
+function edgeStroke(kind: EdgeRef["kind"], highlighted: boolean): string {
+  if (highlighted) return "rgba(142, 219, 255, 0.95)";
+  if (kind === "repair") return "rgba(255, 184, 96, 0.9)";
+  if (kind === "policy_guard") return "rgba(120, 207, 173, 0.9)";
+  if (kind === "soft_depends_on") return "rgba(173, 187, 220, 0.8)";
+  return "rgba(127, 154, 196, 0.56)";
 }

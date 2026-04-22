@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { discoverWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import type { WorkspaceFacts } from "../spec/schemas.js";
@@ -20,6 +20,17 @@ import {
   type DagRunResult,
   type DagRunSummary,
 } from "./types.js";
+import {
+  GraphManifestV2Schema,
+  GraphModeSchema,
+  manifestV1ToGraphV2,
+} from "./graph-v2.js";
+import {
+  DagRunEventSchema,
+  appendDagRunEventFile,
+  materializeDagRunSnapshots,
+  type DagRunEvent,
+} from "./events.js";
 import {
   applyExecutorTemplate,
   buildProfileCommand,
@@ -812,6 +823,7 @@ function shouldIgnoreRelativePath(args: {
   relativePath: string;
   artifactsDirRel: string;
   repairsDirRel: string;
+  additionalIgnorePrefixes?: string[];
   gitIgnoredPrefixes: string[];
 }): boolean {
   const rel = normalizePathForOutput(args.relativePath);
@@ -820,6 +832,7 @@ function shouldIgnoreRelativePath(args: {
   const ignoredPrefixes = [
     normalizePathForOutput(args.artifactsDirRel).replace(/\/$/, ""),
     normalizePathForOutput(args.repairsDirRel).replace(/\/$/, ""),
+    ...((args.additionalIgnorePrefixes ?? []).map((prefix) => normalizePathForOutput(prefix).replace(/\/$/, ""))),
   ];
 
   if (ignoredPrefixes.some((prefix) => prefix && (rel === prefix || rel.startsWith(`${prefix}/`)))) {
@@ -833,6 +846,7 @@ function snapshotWorkspace(args: {
   workspaceRoot: string;
   artifactsDirRel: string;
   repairsDirRel: string;
+  additionalIgnorePrefixes?: string[];
   gitIgnoredPrefixes: string[];
   maxFiles?: number;
 }): Map<string, string> {
@@ -864,6 +878,7 @@ function snapshotWorkspace(args: {
         relativePath,
         artifactsDirRel: args.artifactsDirRel,
         repairsDirRel: args.repairsDirRel,
+        additionalIgnorePrefixes: args.additionalIgnorePrefixes,
         gitIgnoredPrefixes: args.gitIgnoredPrefixes,
       })) {
         continue;
@@ -2274,6 +2289,9 @@ function buildBudgetSnapshot(args: {
 export async function runDag(args: {
   workspaceRoot: string;
   manifestPath: string;
+  graphMode?: "v1" | "v2" | "auto";
+  runId?: string;
+  eventsPath?: string;
   executorTemplate?: string;
   executorProfile?: ExecutorProfile;
   executorProvider?: ExecutorProvider;
@@ -2325,9 +2343,47 @@ export async function runDag(args: {
 }): Promise<DagRunSummary> {
   const runStartedAt = new Date().toISOString();
   const runStartedAtMs = Date.now();
+  const runId = args.runId?.trim() ? args.runId.trim() : randomUUID();
   const workspaceRoot = path.resolve(args.workspaceRoot);
   const manifestAbs = path.resolve(workspaceRoot, args.manifestPath);
   const manifest = loadManifest(manifestAbs);
+  const manifestPathRel = normalizePathForOutput(path.relative(workspaceRoot, manifestAbs));
+  const requestedGraphMode = GraphModeSchema.parse(args.graphMode ?? "auto");
+  const resolvedGraphMode = requestedGraphMode === "auto" ? "v1" : requestedGraphMode;
+  const summaryPathRel = normalizePathForOutput(args.outputPath ?? "generated/orchestration/dag/run-summary.json");
+  const summaryDirRel = normalizePathForOutput(path.dirname(summaryPathRel));
+  const runSummaryV2PathRel = normalizePathForOutput(path.join(summaryDirRel, "run-summary.v2.json"));
+  const nodeStateV2PathRel = normalizePathForOutput(path.join(summaryDirRel, "node-state.v2.json"));
+  const defaultEventsPathRel = summaryPathRel.endsWith(".json")
+    ? `${summaryPathRel.slice(0, Math.max(0, summaryPathRel.length - 5))}.events.ndjson`
+    : `${summaryPathRel}.events.ndjson`;
+  const eventsPathRel = normalizePathForOutput(args.eventsPath ?? defaultEventsPathRel);
+  const runtimeIgnorePrefixes = [eventsPathRel, runSummaryV2PathRel, nodeStateV2PathRel];
+  const eventsAbs = path.resolve(workspaceRoot, eventsPathRel);
+  mkdirSync(path.dirname(eventsAbs), { recursive: true });
+  writeFileSync(eventsAbs, "", "utf8");
+  const graphPathRel = normalizePathForOutput(path.join(path.dirname(manifestPathRel), "graph.json"));
+  const graphAbs = path.resolve(workspaceRoot, graphPathRel);
+  let graph: ReturnType<typeof GraphManifestV2Schema.safeParse> | null = null;
+  if (existsSync(graphAbs)) {
+    try {
+      graph = GraphManifestV2Schema.safeParse(JSON.parse(readFileSync(graphAbs, "utf8")));
+    } catch {
+      graph = null;
+    }
+  }
+  const graphForSnapshots = graph?.success ? graph.data : manifestV1ToGraphV2(manifest);
+  const graphPathForRun = graph?.success ? graphPathRel : null;
+  const dagEvents: DagRunEvent[] = [];
+  const emitEvent = (event: { type: DagRunEvent["type"]; at?: string; [key: string]: unknown }) => {
+    const next = DagRunEventSchema.parse({
+      runId,
+      at: event.at ?? new Date().toISOString(),
+      ...event,
+    });
+    dagEvents.push(next);
+    appendDagRunEventFile(eventsAbs, next);
+  };
   const gitRepoRoot = resolveGitRepoRoot(workspaceRoot);
   const timeoutMs = Math.max(1000, args.timeoutMs ?? 10 * 60 * 1000);
   const analyzeTimeoutMs = clampAtLeastInt(
@@ -2337,7 +2393,7 @@ export async function runDag(args: {
   );
   const failPolicy = args.failPolicy ?? "graph";
   const dryRun = Boolean(args.dryRun);
-  const executorProfile = args.executorProfile ?? "none";
+  const executorProfile = args.executorProfile ?? "codex-safe";
   const applyMode = args.applyMode ?? "dry-run";
   const artifactsDirRel = normalizePathForOutput(args.artifactsDir ?? "generated/orchestration/dag/artifacts");
   const repairsDirRel = normalizePathForOutput(args.repairsDir ?? "generated/orchestration/dag/repairs");
@@ -2449,6 +2505,15 @@ export async function runDag(args: {
   let fullSuiteCheckpointSatisfied = false;
   const failedModules = new Set<string>();
   const resultByModule = new Map<string, DagRunResult>();
+  let budgetExhaustedEventEmitted = false;
+
+  emitEvent({
+    type: "run_started",
+    manifestPath: manifestPathRel,
+    graphPath: graphPathForRun,
+    moduleCount: manifest.modules.length,
+    at: runStartedAt,
+  });
 
   const levels = topoLevelOrder(manifest.modules);
   const workspaceFacts = testImpactMode === "off" ? null : discoverWorkspaceFacts(workspaceRoot);
@@ -2470,6 +2535,18 @@ export async function runDag(args: {
     } else {
       successfulModules += 1;
     }
+  };
+  const emitNodeCompleted = (result: DagRunResult) => {
+    emitEvent({
+      type: "node_completed",
+      nodeId: result.moduleId,
+      attempt: result.attempt ?? 1,
+      status: result.status,
+      code: result.code ?? null,
+      durationMs: result.durationMs,
+      artifactPath: result.artifactPath ?? null,
+      repairTaskPath: result.repairTaskPath ?? null,
+    });
   };
 
   const evaluateCanaryCheckpoint = async () => {
@@ -2503,6 +2580,11 @@ export async function runDag(args: {
   };
 
   const executeModule = async (module: DagManifest["modules"][number]): Promise<DagRunResult> => {
+    const finalizeResult = (result: DagRunResult): DagRunResult => {
+      emitNodeCompleted(result);
+      return result;
+    };
+
     const modulePartAbs = path.resolve(workspaceRoot, module.partPath);
     const initialCommand = resolveModuleCommand({
       moduleCommand: module.command,
@@ -2518,7 +2600,7 @@ export async function runDag(args: {
     });
 
     if (!initialCommand) {
-      return DagRunResultSchema.parse({
+      return finalizeResult(DagRunResultSchema.parse({
         moduleId: module.id,
         status: "skipped",
         command: null,
@@ -2531,7 +2613,7 @@ export async function runDag(args: {
         repairTaskPath: null,
         criticPassed: null,
         testImpactCommands: [],
-      });
+      }));
     }
 
     const moduleInputDigest = computeModuleInputDigest({
@@ -2550,7 +2632,7 @@ export async function runDag(args: {
       resumeHit.inputDigest === moduleInputDigest
     ) {
       resumedModules += 1;
-      return DagRunResultSchema.parse({
+      return finalizeResult(DagRunResultSchema.parse({
         moduleId: module.id,
         status: "success",
         command: resumeHit.artifact.command?.command ?? initialCommand,
@@ -2573,7 +2655,7 @@ export async function runDag(args: {
         tokensEstimated: 0,
         tokensEffective: 0,
         resumedFromArtifact: true,
-      });
+      }));
     }
 
     let attempt = 1;
@@ -2593,6 +2675,13 @@ export async function runDag(args: {
       if (budgetReasons.length > 0) {
         budgetState.exhausted = true;
         budgetState.reasons = budgetReasons;
+        if (!budgetExhaustedEventEmitted) {
+          emitEvent({
+            type: "budget_exhausted",
+            reasons: budgetReasons,
+          });
+          budgetExhaustedEventEmitted = true;
+        }
 
         lastResult = DagRunResultSchema.parse({
           moduleId: module.id,
@@ -2624,6 +2713,7 @@ export async function runDag(args: {
           workspaceRoot,
           artifactsDirRel,
           repairsDirRel,
+          additionalIgnorePrefixes: runtimeIgnorePrefixes,
           gitIgnoredPrefixes: gitIgnoredPrefixesBase,
         });
 
@@ -2637,6 +2727,11 @@ export async function runDag(args: {
       const commandTimeoutMs = commandForExecution.includes("timeboxed.sh")
         ? Math.max(1_000, moduleTimeoutBudgetMs + 30_000)
         : Math.max(1_000, moduleTimeoutBudgetMs);
+      emitEvent({
+        type: "node_started",
+        nodeId: module.id,
+        attempt,
+      });
 
       let commandResult = shouldAutoPassAnalyzeInDryRun
         ? DagRunResultSchema.parse({
@@ -2770,6 +2865,7 @@ export async function runDag(args: {
           workspaceRoot,
           artifactsDirRel,
           repairsDirRel,
+          additionalIgnorePrefixes: runtimeIgnorePrefixes,
           gitIgnoredPrefixes: mergeGitIgnoredPrefixes(
             gitIgnoredPrefixesBase,
             loadGitIgnoredPrefixes({
@@ -2796,6 +2892,14 @@ export async function runDag(args: {
         policyPacks,
         policyCriticRules,
         failLevel: criticFailLevel,
+      });
+      emitEvent({
+        type: "critic_evaluated",
+        nodeId: module.id,
+        attempt,
+        passed: critic.passed,
+        severity: critic.severity,
+        findingCount: critic.findings.length,
       });
 
       const shouldRunTestImpact =
@@ -2975,6 +3079,12 @@ export async function runDag(args: {
         memoryRevisit: memoryRevisit,
       });
       repairsGenerated += 1;
+      emitEvent({
+        type: "repair_generated",
+        nodeId: module.id,
+        attempt,
+        repairTaskPath,
+      });
 
       const repairPartAbs = path.resolve(workspaceRoot, repairTaskPath);
       partFileForAttempt = repairPartAbs;
@@ -2999,7 +3109,7 @@ export async function runDag(args: {
     }
 
     if (!lastResult) {
-      return DagRunResultSchema.parse({
+      return finalizeResult(DagRunResultSchema.parse({
         moduleId: module.id,
         status: "failed",
         command: initialCommand,
@@ -3012,10 +3122,10 @@ export async function runDag(args: {
         repairTaskPath,
         criticPassed: null,
         testImpactCommands: [],
-      });
+      }));
     }
 
-    return lastResult;
+    return finalizeResult(lastResult);
   };
 
   for (const level of levels) {
@@ -3031,22 +3141,22 @@ export async function runDag(args: {
           const module = moduleById.get(moduleId);
           if (!module) continue;
 
-          addResult(
-            DagRunResultSchema.parse({
-              moduleId: module.id,
-              status: "blocked",
-              command: null,
-              code: null,
-              stdout: "",
-              stderr: `wave approval missing: ${path.relative(workspaceRoot, approvalPath).replace(/\\/g, "/")}`,
-              durationMs: 0,
-              changedFiles: [],
-              artifactPath: null,
-              repairTaskPath: null,
-              criticPassed: null,
-              testImpactCommands: [],
-            }),
-          );
+          const blockedResult = DagRunResultSchema.parse({
+            moduleId: module.id,
+            status: "blocked",
+            command: null,
+            code: null,
+            stdout: "",
+            stderr: `wave approval missing: ${path.relative(workspaceRoot, approvalPath).replace(/\\/g, "/")}`,
+            durationMs: 0,
+            changedFiles: [],
+            artifactPath: null,
+            repairTaskPath: null,
+            criticPassed: null,
+            testImpactCommands: [],
+          });
+          emitNodeCompleted(blockedResult);
+          addResult(blockedResult);
         }
 
         if (shouldHalt()) {
@@ -3078,22 +3188,22 @@ export async function runDag(args: {
 
         const failedDeps = module.dependsOn.filter((dep) => failedModules.has(dep));
         if (failedDeps.length > 0) {
-          addResult(
-            DagRunResultSchema.parse({
-              moduleId: module.id,
-              status: "blocked",
-              command: null,
-              code: null,
-              stdout: "",
-              stderr: `blocked by failed dependencies: ${failedDeps.join(", ")}`,
-              durationMs: 0,
-              changedFiles: [],
-              artifactPath: null,
-              repairTaskPath: null,
-              criticPassed: null,
-              testImpactCommands: [],
-            }),
-          );
+          const blockedResult = DagRunResultSchema.parse({
+            moduleId: module.id,
+            status: "blocked",
+            command: null,
+            code: null,
+            stdout: "",
+            stderr: `blocked by failed dependencies: ${failedDeps.join(", ")}`,
+            durationMs: 0,
+            changedFiles: [],
+            artifactPath: null,
+            repairTaskPath: null,
+            criticPassed: null,
+            testImpactCommands: [],
+          });
+          emitNodeCompleted(blockedResult);
+          addResult(blockedResult);
           queue.splice(index, 1);
           launched = true;
           continue;
@@ -3168,10 +3278,6 @@ export async function runDag(args: {
     }
   }
 
-  const results = manifest.modules
-    .map((module) => resultByModule.get(module.id))
-    .filter((result): result is DagRunResult => Boolean(result));
-
   if (canaryBlocked) {
     const seen = new Set(resultByModule.keys());
     for (const module of manifest.modules) {
@@ -3190,6 +3296,7 @@ export async function runDag(args: {
         criticPassed: null,
         testImpactCommands: [],
       });
+      emitNodeCompleted(blockedResult);
       resultByModule.set(module.id, blockedResult);
       failedModules.add(module.id);
     }
@@ -3212,11 +3319,26 @@ export async function runDag(args: {
     : successes > 0
     ? "success"
     : "failure";
+  const completedAt = new Date().toISOString();
+
+  emitEvent({
+    type: "run_completed",
+    status,
+    successCount: successes,
+    failedCount: failures,
+    blockedCount: blocked,
+    skippedCount: finalResults.filter((result) => result.status === "skipped").length,
+    totalCount: finalResults.length,
+    at: completedAt,
+  });
 
   const summary = DagRunSummarySchema.parse({
-    manifestPath: path.relative(workspaceRoot, manifestAbs).replace(/\\/g, "/"),
+    runId,
+    graphMode: resolvedGraphMode,
+    eventsPath: eventsPathRel,
+    manifestPath: manifestPathRel,
     startedAt: runStartedAt,
-    completedAt: new Date().toISOString(),
+    completedAt,
     status,
     results: finalResults,
     resumedModules,
@@ -3250,8 +3372,20 @@ export async function runDag(args: {
     },
   });
 
+  const materialized = materializeDagRunSnapshots({
+    graph: graphForSnapshots,
+    events: dagEvents,
+    runId,
+    graphMode: resolvedGraphMode,
+    graphPath: graphPathForRun,
+    manifestPath: manifestPathRel,
+    processActive: false,
+  });
+  writeFileSync(path.resolve(workspaceRoot, runSummaryV2PathRel), `${JSON.stringify(materialized.runSummary, null, 2)}\n`, "utf8");
+  writeFileSync(path.resolve(workspaceRoot, nodeStateV2PathRel), `${JSON.stringify(materialized.nodeState, null, 2)}\n`, "utf8");
+
   if (args.outputPath) {
-    const outAbs = path.resolve(workspaceRoot, args.outputPath);
+    const outAbs = path.resolve(workspaceRoot, summaryPathRel);
     mkdirSync(path.dirname(outAbs), { recursive: true });
     writeFileSync(outAbs, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
   }

@@ -12,6 +12,7 @@ AUTONOMY_DIR="generated/orchestration/autonomy"
 MAX_ITERATIONS=20
 SLEEP_SECONDS=3
 HEARTBEAT_SECONDS=10
+BOOTSTRAP_WORKSPACE=true
 SOURCE_POLICY="primary_plus_curated_secondary"
 RISK_GATE_MODE="strict_blockers"
 WAVE_STRATEGY=""
@@ -31,6 +32,7 @@ COMMAND_TIMEOUT_MS=""
 ANALYZE_TIMEOUT_MS=""
 EXECUTOR_TEMPLATE=""
 APPLY_MODE="dry-run"
+GRAPH_MODE="auto"
 APPLY_GUARD_TOKEN=""
 APPLY_GUARD_VALUE=""
 APPROVALS_DIR=""
@@ -208,6 +210,7 @@ Core options:
   --max-iterations <n>            Max autonomous iterations (default: 20)
   --sleep-seconds <n>             Delay between iterations while not done (default: 3)
   --heartbeat-seconds <n>         In-flight heartbeat interval while auto-run executes (default: 10, 0 disables)
+  --bootstrap-workspace <bool>    Ensure target workspace deps/tools exist before loop (default: true)
 
 Planning/discovery options:
   --source-policy <policy>        primary_only|primary_plus_curated_secondary|open_web
@@ -234,6 +237,7 @@ Execution options:
   --provider-template <cmd>       Template for custom provider ({prompt}, {moduleId}, {title}, {partFile})
   --executor <template>           Optional command template override for DAG modules
   --apply-mode <mode>             dry-run|apply (default: dry-run)
+  --graph-mode <mode>             v1|v2|auto (default: auto)
   --apply-guard-token <token>     Required in apply mode unless default guard is used
   --apply-guard-value <token>     Expected guard value (default: ALLOW_APPLY)
   --approvals-dir <path>          Apply approvals directory
@@ -339,6 +343,10 @@ while [[ $# -gt 0 ]]; do
       HEARTBEAT_SECONDS="${2:-}"
       shift 2
       ;;
+    --bootstrap-workspace)
+      BOOTSTRAP_WORKSPACE="${2:-}"
+      shift 2
+      ;;
     --source-policy)
       SOURCE_POLICY="${2:-}"
       shift 2
@@ -427,6 +435,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --apply-mode)
       APPLY_MODE="${2:-}"
+      shift 2
+      ;;
+    --graph-mode)
+      GRAPH_MODE="${2:-}"
       shift 2
       ;;
     --apply-guard-token)
@@ -710,8 +722,18 @@ if ! [[ "$HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || [[ "$HEARTBEAT_SECONDS" -lt 0 ]];
   exit 1
 fi
 
+if [[ "$BOOTSTRAP_WORKSPACE" != "true" && "$BOOTSTRAP_WORKSPACE" != "false" ]]; then
+  echo "ERROR: --bootstrap-workspace must be true or false" >&2
+  exit 1
+fi
+
 if [[ "$APPLY_MODE" != "dry-run" && "$APPLY_MODE" != "apply" ]]; then
   echo "ERROR: --apply-mode must be dry-run or apply" >&2
+  exit 1
+fi
+
+if [[ "$GRAPH_MODE" != "v1" && "$GRAPH_MODE" != "v2" && "$GRAPH_MODE" != "auto" ]]; then
+  echo "ERROR: --graph-mode must be v1, v2, or auto" >&2
   exit 1
 fi
 
@@ -945,6 +967,105 @@ NODE
   echo "    planPreview=$preview_line"
 }
 
+ensure_workspace_bootstrap() {
+  if [[ "$BOOTSTRAP_WORKSPACE" != "true" ]]; then
+    return 0
+  fi
+
+  local pkg_json="$WORKSPACE_ROOT_ABS/package.json"
+  local bin_dir="$WORKSPACE_ROOT_ABS/node_modules/.bin"
+  local should_install=false
+  local reason=""
+  local inferred_bins=""
+
+  if [[ ! -f "$pkg_json" ]]; then
+    return 0
+  fi
+
+  inferred_bins="$(
+    node - "$pkg_json" <<'NODE'
+const fs = require("node:fs");
+const pkgPath = process.argv[2];
+
+try {
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const scripts = pkg && typeof pkg === "object" && pkg.scripts && typeof pkg.scripts === "object"
+    ? Object.values(pkg.scripts).filter((value) => typeof value === "string")
+    : [];
+  const content = scripts.join("\n");
+  const checks = [
+    ["jest", /\bjest\b/],
+    ["nx", /\bnx\b/],
+    ["vitest", /\bvitest\b/],
+    ["tsc", /\btsc\b/],
+    ["webpack", /\bwebpack\b/],
+    ["rsbuild", /\brsbuild\b/],
+    ["eslint", /\beslint\b/],
+  ];
+  const out = [];
+  for (const [bin, pattern] of checks) {
+    if (pattern.test(content)) out.push(bin);
+  }
+  process.stdout.write(out.join(" "));
+} catch (_error) {
+  process.stdout.write("");
+}
+NODE
+  )"
+
+  if [[ ! -d "$bin_dir" ]]; then
+    should_install=true
+    reason="node_modules/.bin missing"
+  fi
+
+  if [[ -d "$bin_dir" && -n "$inferred_bins" ]]; then
+    for bin_name in $inferred_bins; do
+      if [[ ! -x "$bin_dir/$bin_name" ]]; then
+        should_install=true
+        reason="${reason:+$reason; }script-referenced binary missing ($bin_name)"
+      fi
+    done
+  fi
+
+  if [[ "$should_install" != "true" ]]; then
+    return 0
+  fi
+
+  local pm="${ORCHESTRATOR_PM:-}"
+  if [[ -z "$pm" ]]; then
+    if [[ -f "$WORKSPACE_ROOT_ABS/pnpm-lock.yaml" ]]; then
+      pm="pnpm"
+    elif [[ -f "$WORKSPACE_ROOT_ABS/yarn.lock" ]]; then
+      pm="yarn"
+    elif [[ -f "$WORKSPACE_ROOT_ABS/package-lock.json" ]]; then
+      pm="npm"
+    else
+      pm="pnpm"
+    fi
+  fi
+
+  echo "bootstrap: installing workspace dependencies ($reason)"
+  if [[ "$pm" == "pnpm" ]]; then
+    pnpm -C "$WORKSPACE_ROOT_ABS" install
+    return 0
+  fi
+
+  if [[ "$pm" == "yarn" ]]; then
+    (cd "$WORKSPACE_ROOT_ABS" && yarn install)
+    return 0
+  fi
+
+  if [[ "$pm" == "npm" ]]; then
+    npm --prefix "$WORKSPACE_ROOT_ABS" install
+    return 0
+  fi
+
+  echo "bootstrap: ORCHESTRATOR_PM='$pm' is unsupported for bootstrap install (expected pnpm|npm|yarn)" >&2
+  return 1
+}
+
+ensure_workspace_bootstrap
+
 for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
   cleanup_orphan_provider_processes
 
@@ -969,6 +1090,7 @@ for ((iteration=1; iteration<=MAX_ITERATIONS; iteration++)); do
     --analyze-timeout-ms "$ANALYZE_TIMEOUT_MS"
     --executor-profile "$EXECUTOR_PROFILE"
     --apply-mode "$APPLY_MODE"
+    --graph-mode "$GRAPH_MODE"
     --fail-policy "$FAIL_POLICY"
     --test-impact "$TEST_IMPACT_MODE"
     --full-test-in-dry-run "$FULL_TEST_IN_DRY_RUN"

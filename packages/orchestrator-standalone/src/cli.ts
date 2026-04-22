@@ -185,6 +185,12 @@ function parseTestImpactMode(value: string | undefined): "off" | "targeted" | "t
   throw new Error("--test-impact must be off, targeted, or targeted_then_full");
 }
 
+function parseGraphMode(value: string | undefined): "v1" | "v2" | "auto" {
+  if (!value || value === "auto") return "auto";
+  if (value === "v1" || value === "v2") return value;
+  throw new Error("--graph-mode must be v1, v2, or auto");
+}
+
 function loadRecipeFile(workspaceRoot: string, recipeFile: string) {
   const absolute = path.isAbsolute(recipeFile) ? recipeFile : path.resolve(workspaceRoot, recipeFile);
   const parsed = JSON.parse(readFileSync(absolute, "utf8"));
@@ -283,15 +289,19 @@ function printHelp(): void {
   process.stdout.write(`DAG options:\n`);
   process.stdout.write(`  --request <path>             (dag-compile)\n`);
   process.stdout.write(`  --dependency <sequential|parallel|staged>\n`);
+  process.stdout.write(`  --run-id <id>                (dag-run/auto-run correlation id)\n`);
+  process.stdout.write(`  --graph-mode <v1|v2|auto>   (dag-compile/dag-run/auto-run; default: auto)\n`);
+  process.stdout.write(`  --graph-v2-inject-policy-anchors <bool> (auto-run; default: false)\n`);
   process.stdout.write(`  --output-dir <path>          (dag-compile; default: generated/orchestration/dag)\n`);
   process.stdout.write(`  --manifest <path>            (dag-run / skills-autogen)\n`);
   process.stdout.write(`  --executor <cmd-template>    placeholders: {id} {title} {partFile} {requestPath}\n`);
-  process.stdout.write(`  --executor-profile <none|codex-safe|claude-safe>\n`);
+  process.stdout.write(`  --executor-profile <none|codex-safe|claude-safe> (dag-run/auto-run; default: codex-safe)\n`);
   process.stdout.write(`  --executor-provider <codex|claude|custom>\n`);
   process.stdout.write(`  --provider-preset <codex|claude|claude-subscription|openai|anthropic>\n`);
   process.stdout.write(`  --claude-subscription        alias for --provider-preset claude-subscription\n`);
   process.stdout.write(`  --provider-template <cmd-template> placeholders: {prompt} {moduleId} {title} {partFile}\n`);
   process.stdout.write(`  --apply-mode <dry-run|apply> (dag-run; default: dry-run)\n`);
+  process.stdout.write(`  --events-path <path>         (dag-run; default: <summary>.events.ndjson)\n`);
   process.stdout.write(`  --apply-guard-token <token>  (required for apply mode unless matching default guard)\n`);
   process.stdout.write(`  --apply-guard-value <token>  (default guard is ALLOW_APPLY)\n`);
   process.stdout.write(`  --approvals-dir <path>       apply approvals dir (default: generated/orchestration/approvals)\n`);
@@ -1272,6 +1282,7 @@ async function commandSynthesizeTasks(args: ParsedArgs): Promise<void> {
       requestPath: path.relative(workspaceRoot, synthesized.requestPath).replace(/\\/g, "/"),
       outputDir,
       dependencyMode: DagDependencyModeSchema.parse(option(args, "dependency", "staged")),
+      graphMode: parseGraphMode(option(args, "graph-mode", "auto")),
     });
     manifestPath = path.resolve(workspaceRoot, outputDir, "manifest.json");
   }
@@ -1291,12 +1302,14 @@ async function commandDagCompile(args: ParsedArgs): Promise<void> {
   const workspaceRoot = option(args, "workspace-root", defaultWorkspaceRoot()) as string;
   const outputDir = option(args, "output-dir", "generated/orchestration/dag") as string;
   const dependencyMode = DagDependencyModeSchema.parse(option(args, "dependency", "staged"));
+  const graphMode = parseGraphMode(option(args, "graph-mode", "auto"));
 
   const manifest = await compileRequestDag({
     workspaceRoot,
     requestPath,
     outputDir,
     dependencyMode,
+    graphMode,
     name: option(args, "name"),
     description: option(args, "description"),
   });
@@ -1314,7 +1327,7 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
     throw new Error("--fail-policy must be graph or global");
   }
 
-  let executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "none") as string);
+  let executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "codex-safe") as string);
   let executorProviderRaw = parseExecutorProvider(option(args, "executor-provider"));
   let providerTemplateRaw = option(args, "provider-template");
   const preset = parseProviderPreset(
@@ -1332,10 +1345,15 @@ async function commandDagRun(args: ParsedArgs): Promise<void> {
   const policyPackIds = optionList(args, "policy-pack");
   const timeoutMs = parseNumber(args, "timeout-ms", 10 * 60 * 1000);
   const testImpactMode = parseTestImpactMode(option(args, "test-impact", "off"));
+  const graphMode = parseGraphMode(option(args, "graph-mode", "auto"));
+  const runId = option(args, "run-id");
 
   const summary = await runDag({
     workspaceRoot,
     manifestPath,
+    graphMode,
+    runId,
+    eventsPath: option(args, "events-path"),
     executorTemplate: option(args, "executor"),
     executorProfile: executorProfileRaw,
     executorProvider: executorProviderRaw,
@@ -1686,6 +1704,7 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
   const ragReplayMaxAgeDays = parseNumber(args, "rag-replay-max-age-days", 90);
   const ragReplayMinScore = parseNumber(args, "rag-replay-min-score", 0);
   const ragReplayMinSuccessCount = parseNumber(args, "rag-replay-min-success-count", 1);
+  const graphMode = parseGraphMode(option(args, "graph-mode", "auto"));
 
   const synthesized = synthesizeTaskRequest({
     workspaceRoot,
@@ -1718,6 +1737,11 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
     requestPath: path.relative(workspaceRoot, synthesized.requestPath).replace(/\\/g, "/"),
     outputDir: dagOutputDir,
     dependencyMode: DagDependencyModeSchema.parse(option(args, "dependency", "staged")),
+    graphMode,
+    recipeContext: {
+      policyPackIds: policyApplied.appliedPacks.map((pack) => pack.id),
+      injectPolicyAnchors: option(args, "graph-v2-inject-policy-anchors", "false") === "true",
+    },
   });
 
   let executorProfileRaw = parseExecutorProfile(option(args, "executor-profile", "codex-safe") as string);
@@ -1744,6 +1768,9 @@ async function commandAutoRun(args: ParsedArgs): Promise<void> {
   const dagSummary = await runDag({
     workspaceRoot,
     manifestPath: path.relative(workspaceRoot, dagManifestPath),
+    graphMode,
+    runId: semanticRunId,
+    eventsPath: option(args, "events-path"),
     executorTemplate: option(args, "executor"),
     executorProfile: executorProfileRaw,
     executorProvider: executorProviderRaw,

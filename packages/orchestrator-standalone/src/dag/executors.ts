@@ -35,6 +35,7 @@ export function buildSafePrompt(args: {
     `Request path: ${args.requestPath}`,
     `Part file: ${args.partFile}`,
     modeLine(args.applyMode),
+    "Package manager rule: prefer pnpm for install/run/test commands when available in this workspace.",
     "Always report exact commands run and outcomes.",
   ].join("\n");
 }

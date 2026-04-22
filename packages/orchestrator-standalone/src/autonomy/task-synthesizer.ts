@@ -1,11 +1,12 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { getRecipeById } from "../recipes/catalog.js";
 import { discoverWorkspaceFacts } from "../adapters/workspace-discovery.js";
 import { loadRagIndex, queryRagIndex } from "../rag/retriever.js";
 import { runAutoRefineQuery } from "../rag/refine.js";
 import { recordReplayOutcome, suggestReplayQueries } from "../rag/replay-memory.js";
-import { ExecutionRecipeSchema, type ExecutionRecipe } from "../spec/schemas.js";
+import { ExecutionRecipeSchema, type ExecutionRecipe, type GateDefinition } from "../spec/schemas.js";
+import type { WorkspaceFacts } from "../spec/schemas.js";
 
 interface DiscoveryPayload {
   recipeId?: string;
@@ -206,6 +207,129 @@ function renderRagEvidence(args: {
   return `${lines.join("\n")}\n`;
 }
 
+function maybeWorkspaceReadinessTask(args: {
+  workspaceRoot: string;
+  workspaceFacts: WorkspaceFacts;
+  recipe: ExecutionRecipe;
+}): { title: string; bullets: string[] } | null {
+  const rootPkg = (args.workspaceFacts.packages ?? []).find((pkg) => pkg.path === ".");
+  const rootScripts = new Set(rootPkg?.scripts ?? []);
+  const detectedBuildTools = new Set(args.workspaceFacts.detectedBuildTools ?? []);
+  const issues: string[] = [];
+  const nodeModulesBin = path.join(args.workspaceRoot, "node_modules", ".bin");
+  const missingFiles: string[] = [];
+  const missingBuildTools: string[] = [];
+  const packageManager = args.workspaceFacts.packageManager;
+
+  if (!existsSync(nodeModulesBin)) {
+    issues.push("Workspace dependencies are missing (`node_modules/.bin` not found).");
+  }
+
+  for (const requiredFile of args.recipe.preconditions.requiresFiles) {
+    if (!existsSync(path.join(args.workspaceRoot, requiredFile))) {
+      missingFiles.push(requiredFile);
+    }
+  }
+
+  for (const requiredBuildTool of args.recipe.preconditions.requiresBuildTools) {
+    if (!detectedBuildTools.has(requiredBuildTool)) {
+      missingBuildTools.push(requiredBuildTool);
+    }
+  }
+
+  if (missingFiles.length > 0) {
+    issues.push(`Recipe preconditions missing files: ${missingFiles.join(", ")}.`);
+  }
+  if (missingBuildTools.length > 0) {
+    issues.push(`Recipe preconditions missing build-tool signals: ${missingBuildTools.join(", ")}.`);
+  }
+
+  if (!args.recipe.preconditions.packageManagers.includes(packageManager)) {
+    issues.push(
+      `Detected package manager \`${packageManager}\` is outside recipe preconditions (${args.recipe.preconditions.packageManagers.join(", ")}).`,
+    );
+  }
+
+  const gateScriptRequirements = collectGateScriptRequirements(args.recipe.gates);
+  const missingGateScripts = gateScriptRequirements
+    .filter((requirement) => requirement.scripts.length > 0 && !requirement.scripts.some((script) => rootScripts.has(script)));
+
+  if (missingGateScripts.length > 0) {
+    for (const requirement of missingGateScripts.slice(0, 5)) {
+      issues.push(
+        `Gate "${requirement.title}" expects root script(s): ${requirement.scripts.join(" | ")}; none found in root package.json.`,
+      );
+    }
+    if (missingGateScripts.length > 5) {
+      issues.push(`Additional gate script mismatches: ${missingGateScripts.length - 5}.`);
+    }
+  }
+
+  if (issues.length === 0) return null;
+
+  const resolvedPackageManager = packageManager === "unknown" ? "pnpm" : packageManager;
+  const installCommand = resolvedPackageManager === "pnpm"
+    ? "pnpm install"
+    : resolvedPackageManager === "yarn"
+      ? "yarn install"
+      : "npm install";
+
+  return {
+    title: "Workspace readiness bootstrap",
+    bullets: [
+      ...issues,
+      `Run dependency bootstrap first: ${installCommand}`,
+      "Re-run required gate commands in isolation and verify toolchain binaries resolve before scheduling parallel DAG modules.",
+      "Patch either root scripts or gate command mapping when script aliases differ.",
+      "Record readiness evidence before continuing transform/verify tasks.",
+    ],
+  };
+}
+
+function extractGateCommandScripts(command: string): string[] {
+  const scripts = new Set<string>();
+
+  const addMatches = (pattern: RegExp): void => {
+    for (const match of command.matchAll(pattern)) {
+      const script = match[1]?.trim();
+      if (script) scripts.add(script);
+    }
+  };
+
+  addMatches(/\b(?:pnpm|npm)(?:\s+--?[a-zA-Z0-9-]+)*\s+run\s+([a-zA-Z0-9:_-]+)/g);
+  addMatches(/\byarn\s+run\s+([a-zA-Z0-9:_-]+)/g);
+  addMatches(/\byarn\s+([a-zA-Z0-9:_-]+)/g);
+  addMatches(/\b(?:pnpm|npm)(?:\s+--?[a-zA-Z0-9-]+)*\s+(test|start|build|lint)\b/g);
+
+  const nonScriptYarnCommands = new Set([
+    "add",
+    "install",
+    "remove",
+    "up",
+    "upgrade",
+    "cache",
+    "set",
+    "dlx",
+    "exec",
+    "workspaces",
+  ]);
+
+  for (const commandName of nonScriptYarnCommands) {
+    scripts.delete(commandName);
+  }
+
+  return Array.from(scripts);
+}
+
+function collectGateScriptRequirements(gates: GateDefinition[]): Array<{ title: string; scripts: string[] }> {
+  return gates
+    .filter((gate) => gate.kind === "command" && gate.required && gate.command)
+    .map((gate) => ({
+      title: gate.title,
+      scripts: extractGateCommandScripts(gate.command ?? ""),
+    }));
+}
+
 export function synthesizeTaskRequest(args: {
   workspaceRoot: string;
   goalType: string;
@@ -234,7 +358,7 @@ export function synthesizeTaskRequest(args: {
   const workspaceRoot = path.resolve(args.workspaceRoot);
   const recipe = args.recipe ? ExecutionRecipeSchema.parse(args.recipe) : getRecipeById(args.recipeId);
   const discovery = readDiscoveryFile(args.discoveryPath);
-  const workspaceFacts = discovery.workspaceFacts ?? discoverWorkspaceFacts(workspaceRoot);
+  const workspaceFacts: WorkspaceFacts = discoverWorkspaceFacts(workspaceRoot);
 
   const queries = Array.from(
     new Set([
@@ -246,6 +370,8 @@ export function synthesizeTaskRequest(args: {
   );
 
   const tasks: Array<{ title: string; bullets: string[] }> = [];
+  const readinessTask = maybeWorkspaceReadinessTask({ workspaceRoot, workspaceFacts, recipe });
+  if (readinessTask) tasks.push(readinessTask);
 
   for (const step of recipe.steps) {
     tasks.push({

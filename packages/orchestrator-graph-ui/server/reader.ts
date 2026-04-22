@@ -12,6 +12,10 @@ interface IterationSummaryInput {
   runId?: string;
   generatedAt?: string;
   dagStatus?: string;
+  artifacts?: {
+    dagManifestPath?: string;
+    dagRunSummaryPath?: string;
+  };
   recipe?: {
     id?: string;
     title?: string;
@@ -62,6 +66,228 @@ interface IterationSummaryInput {
   };
 }
 
+function normalizeGraphMode(value: string | undefined): "v1" | "v2" | "auto" {
+  if (!value || value === "auto") return "auto";
+  if (value === "v1" || value === "v2") return value;
+  return "auto";
+}
+
+function compactPaths(values: Array<string | null | undefined>): string[] {
+  return values.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+}
+
+function resolveRunArtifactPath(workspaceRoot: string, artifactPath?: string): string | null {
+  if (!artifactPath || artifactPath.trim().length === 0) return null;
+  const raw = artifactPath.trim();
+  return path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(workspaceRoot, raw);
+}
+
+function selectManifestByMode(args: {
+  mode: "v1" | "v2" | "auto";
+  manifestV1: ManifestInput | null;
+  graphV2: GraphManifestV2Input | null;
+  graphPath: string | null;
+  errors: string[];
+}): ManifestInput {
+  if (args.mode === "v2") {
+    if (!args.graphV2) {
+      throw new Error(
+        `mode=v2 requested but graph.json is missing or invalid (expected near ${args.graphPath ?? "generated/orchestration/dag/graph.json"}).`,
+      );
+    }
+    return toManifestFromGraph(args.graphV2);
+  }
+
+  if (args.mode === "auto") {
+    if (args.manifestV1) {
+      return args.manifestV1;
+    }
+    if (args.graphV2) {
+      args.errors.push("auto mode fallback: v1 manifest unavailable; using v2 graph projection.");
+      return toManifestFromGraph(args.graphV2);
+    }
+    return { modules: [] };
+  }
+
+  return args.manifestV1 ?? { modules: [] };
+}
+
+function toManifestFromGraph(graph: GraphManifestV2Input): ManifestInput {
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph.edges)
+    ? graph.edges
+        .filter((edge) => edge.source && edge.target)
+        .map((edge) => ({
+          id: edge.id ?? `${edge.source}->${edge.target}:${edge.kind ?? "depends_on"}`,
+          source: edge.source as string,
+          target: edge.target as string,
+          kind: edge.kind,
+          blocking: edge.blocking,
+          rationale: edge.rationale ?? null,
+        }))
+    : [];
+  const depsByTarget = new Map<string, string[]>();
+  for (const edge of edges) {
+    if (edge.kind === "depends_on" || edge.kind === "soft_depends_on") {
+      const list = depsByTarget.get(edge.target) ?? [];
+      list.push(edge.source);
+      depsByTarget.set(edge.target, list);
+    }
+  }
+
+  return {
+    modules: nodes
+      .filter((node) => typeof node.id === "string" && node.id.trim().length > 0)
+      .map((node) => ({
+        id: node.id as string,
+        title: (node.title ?? node.id) as string,
+        description: node.description ?? undefined,
+        level: typeof node.level === "number" ? node.level : 0,
+        mode: node.mode === "analyze" ? "analyze" : "implement",
+        kind: node.kind,
+        entryGroup: typeof node.entryGroup === "string" ? node.entryGroup : null,
+        lockKeys: Array.isArray(node.lockKeys) ? node.lockKeys : [],
+        execution: {
+          partPath: node.execution?.partPath ?? "",
+          command: node.execution?.command ?? null,
+        },
+        dependsOn: Array.from(new Set(Array.isArray(node.dependsOn) && node.dependsOn.length > 0
+          ? node.dependsOn.filter((dep): dep is string => typeof dep === "string" && dep.trim().length > 0)
+          : depsByTarget.get(node.id as string) ?? [])),
+      })),
+    edges,
+  };
+}
+
+function toRunSummaryInputFromV2(value: GraphRunSummaryV2Input | null): RunSummaryInput | null {
+  if (!value) return null;
+  const nodes = Array.isArray(value.nodes) ? value.nodes : [];
+  return {
+    status: value.status,
+    startedAt: value.startedAt ?? undefined,
+    completedAt: value.completedAt ?? undefined,
+    results: nodes
+      .filter((node) => typeof node.id === "string" && node.id.trim().length > 0)
+      .map((node) => ({
+        moduleId: node.id as string,
+        status: toModuleStatus(node.status) ?? "pending",
+        attempt: typeof node.attempt === "number" && node.attempt > 0 ? node.attempt : undefined,
+        code: typeof node.code === "number" || node.code === null ? node.code : undefined,
+        durationMs: typeof node.durationMs === "number" && node.durationMs >= 0 ? node.durationMs : undefined,
+        artifactPath: typeof node.artifactPath === "string" ? node.artifactPath : undefined,
+        repairTaskPath: typeof node.repairTaskPath === "string" ? node.repairTaskPath : undefined,
+      })),
+  };
+}
+
+function mergeNodeStateArtifacts(
+  nodeState: GraphNodeStateV2Input | null,
+  artifacts: Map<string, ArtifactInput>,
+  mtimeMs: number,
+): void {
+  if (!nodeState || !Array.isArray(nodeState.nodes)) return;
+  for (const node of nodeState.nodes) {
+    if (typeof node.id !== "string" || node.id.trim().length === 0) continue;
+    const status = toModuleStatus(node.status);
+    if (!status) continue;
+    artifacts.set(node.id, {
+      moduleId: node.id,
+      status,
+      attempt: typeof node.attempt === "number" && node.attempt > 0 ? node.attempt : undefined,
+      code: typeof node.code === "number" || node.code === null ? node.code : null,
+      durationMs: typeof node.durationMs === "number" ? node.durationMs : undefined,
+      repairTaskPath: typeof node.repairTaskPath === "string" ? node.repairTaskPath : null,
+      artifactPath: typeof node.artifactPath === "string" ? node.artifactPath : undefined,
+      updatedAt: typeof node.updatedAt === "string" ? node.updatedAt : undefined,
+      mtimeMs,
+    });
+  }
+}
+
+function findIterationSummaryByRunId(
+  iterationsDir: string | null,
+  runId: string,
+  errors: string[],
+): string | null {
+  if (!iterationsDir || !fs.existsSync(iterationsDir)) return null;
+  const files = fs
+    .readdirSync(iterationsDir)
+    .filter((file) => /^auto-run-\d+\.json$/.test(file))
+    .map((file) => path.resolve(iterationsDir, file))
+    .sort((a, b) => fileMtimeMs(b) - fileMtimeMs(a));
+
+  for (const filePath of files) {
+    const payload = readJsonFile<IterationSummaryInput>(filePath, errors, "iteration-summary-select");
+    if (!payload) continue;
+    if (typeof payload.runId === "string" && payload.runId.trim() === runId.trim()) {
+      return filePath;
+    }
+    if (path.basename(filePath, ".json") === runId.trim()) {
+      return filePath;
+    }
+  }
+
+  errors.push(`runId '${runId}' not found in iteration summaries; using latest run state.`);
+  return latestIterationSummary(iterationsDir);
+}
+
+interface GraphManifestV2Input {
+  schemaVersion?: string;
+  nodes?: Array<{
+    id?: string;
+    title?: string;
+    description?: string;
+    level?: number;
+    mode?: "analyze" | "implement";
+    kind?: "module" | "gate" | "policy";
+    entryGroup?: string | null;
+    lockKeys?: string[];
+    execution?: {
+      partPath?: string;
+      command?: string | null;
+    };
+    dependsOn?: string[];
+  }>;
+  edges?: Array<{
+    id?: string;
+    source?: string;
+    target?: string;
+    kind?: "depends_on" | "soft_depends_on" | "repair" | "policy_guard";
+    blocking?: boolean;
+    rationale?: string | null;
+  }>;
+}
+
+interface GraphRunSummaryV2Input {
+  schemaVersion?: string;
+  status?: RunStatus;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  nodes?: Array<{
+    id?: string;
+    status?: string;
+    attempt?: number | null;
+    code?: number | null;
+    durationMs?: number | null;
+    artifactPath?: string | null;
+    repairTaskPath?: string | null;
+  }>;
+}
+
+interface GraphNodeStateV2Input {
+  schemaVersion?: string;
+  nodes?: Array<{
+    id?: string;
+    status?: string;
+    attempt?: number | null;
+    code?: number | null;
+    durationMs?: number | null;
+    artifactPath?: string | null;
+    repairTaskPath?: string | null;
+    updatedAt?: string | null;
+  }>;
+}
+
 export interface RunHistoryEntry {
   runId: string;
   recipeId: string | null;
@@ -106,9 +332,14 @@ export interface RunTelemetry {
 }
 
 export interface LoadedRunState {
+  graphMode: "v1" | "v2" | "auto";
   sourcePaths: {
     manifestPath: string | null;
+    graphPath: string | null;
     runSummaryPath: string | null;
+    runSummaryV2Path: string | null;
+    nodeStateV2Path: string | null;
+    eventsPath: string | null;
     artifactsDir: string | null;
     iterationSummaryPath: string | null;
   };
@@ -124,38 +355,86 @@ export function loadRunState(args: {
   repoRoot: string;
   workspaceRootInput?: string;
   autonomyDirInput?: string;
+  modeInput?: string;
+  runIdInput?: string;
 }): LoadedRunState {
   const errors: string[] = [];
+  const graphMode = normalizeGraphMode(args.modeInput);
   const workspaceRoot = resolveWorkspaceRoot(args.repoRoot, args.workspaceRootInput);
   const autonomyDirAbs = resolveAutonomyDir(workspaceRoot, args.autonomyDirInput);
+  const requestedRunId = args.runIdInput?.trim() || null;
 
   const iterationDir = pickExistingDir([
     path.resolve(autonomyDirAbs, "iterations"),
     path.resolve(workspaceRoot, "generated", "orchestration", "autonomy", "iterations"),
   ]);
-  const manifestPath = pickNewestFile([
+  const iterationSummaryPath = requestedRunId
+    ? findIterationSummaryByRunId(iterationDir, requestedRunId, errors)
+    : latestIterationSummary(iterationDir);
+  const iterationSummary = readJsonFile<IterationSummaryInput>(iterationSummaryPath, errors, "iteration-summary");
+  const iterationManifestPath = resolveRunArtifactPath(workspaceRoot, iterationSummary?.artifacts?.dagManifestPath);
+  const iterationRunSummaryPath = resolveRunArtifactPath(workspaceRoot, iterationSummary?.artifacts?.dagRunSummaryPath);
+
+  const manifestPath = pickNewestFile(compactPaths([
+    iterationManifestPath,
     path.resolve(autonomyDirAbs, "dag", "manifest.json"),
     path.resolve(workspaceRoot, "generated", "orchestration", "dag", "manifest.json"),
-  ]);
-  const runSummaryPath = pickNewestFile([
+  ]));
+  const graphPath = pickNewestFile(compactPaths([
+    manifestPath ? path.resolve(path.dirname(manifestPath), "graph.json") : null,
+    iterationManifestPath ? path.resolve(path.dirname(iterationManifestPath), "graph.json") : null,
+    path.resolve(autonomyDirAbs, "dag", "graph.json"),
+    path.resolve(workspaceRoot, "generated", "orchestration", "dag", "graph.json"),
+  ]));
+  const runSummaryPath = pickNewestFile(compactPaths([
+    iterationRunSummaryPath,
     path.resolve(autonomyDirAbs, "dag", "run-summary.json"),
     path.resolve(workspaceRoot, "generated", "orchestration", "dag", "run-summary.json"),
-  ]);
-  const iterationSummaryPath = latestIterationSummary(iterationDir);
+  ]));
+  const runSummaryV2Path = pickNewestFile(compactPaths([
+    runSummaryPath ? path.resolve(path.dirname(runSummaryPath), "run-summary.v2.json") : null,
+    path.resolve(autonomyDirAbs, "dag", "run-summary.v2.json"),
+    path.resolve(workspaceRoot, "generated", "orchestration", "dag", "run-summary.v2.json"),
+  ]));
+  const nodeStateV2Path = pickNewestFile(compactPaths([
+    runSummaryPath ? path.resolve(path.dirname(runSummaryPath), "node-state.v2.json") : null,
+    path.resolve(autonomyDirAbs, "dag", "node-state.v2.json"),
+    path.resolve(workspaceRoot, "generated", "orchestration", "dag", "node-state.v2.json"),
+  ]));
+  const eventsPath = pickNewestFile(compactPaths([
+    runSummaryPath && runSummaryPath.endsWith(".json")
+      ? `${runSummaryPath.slice(0, Math.max(0, runSummaryPath.length - 5))}.events.ndjson`
+      : null,
+    path.resolve(autonomyDirAbs, "dag", "run-summary.events.ndjson"),
+    path.resolve(workspaceRoot, "generated", "orchestration", "dag", "run-summary.events.ndjson"),
+  ]));
 
-  const manifest = readJsonFile<ManifestInput>(manifestPath, errors, "manifest") ?? { modules: [] };
-  const runSummary = readJsonFile<RunSummaryInput>(runSummaryPath, errors, "run-summary");
-  const iterationSummary = readJsonFile<IterationSummaryInput>(iterationSummaryPath, errors, "iteration-summary");
-  const runSummaryMtimeMs = fileMtimeMs(runSummaryPath);
+  const manifestV1 = readJsonFile<ManifestInput>(manifestPath, errors, "manifest");
+  const graphV2 = readJsonFile<GraphManifestV2Input>(graphPath, errors, "graph");
+  const manifest = selectManifestByMode({
+    mode: graphMode,
+    manifestV1,
+    graphV2,
+    graphPath,
+    errors,
+  });
+
+  const runSummaryV1 = readJsonFile<RunSummaryInput>(runSummaryPath, errors, "run-summary");
+  const runSummaryV2 = readJsonFile<GraphRunSummaryV2Input>(runSummaryV2Path, errors, "run-summary.v2");
+  const nodeStateV2 = readJsonFile<GraphNodeStateV2Input>(nodeStateV2Path, errors, "node-state.v2");
+  const runSummary = runSummaryV1 ?? toRunSummaryInputFromV2(runSummaryV2);
+  const runSummaryMtimeMs = Math.max(fileMtimeMs(runSummaryPath), fileMtimeMs(runSummaryV2Path), fileMtimeMs(nodeStateV2Path));
 
   const artifactsSearch = [
+    runSummaryPath ? path.resolve(path.dirname(runSummaryPath), "artifacts") : null,
     path.resolve(autonomyDirAbs, "dag", "artifacts"),
     path.resolve(workspaceRoot, "generated", "orchestration", "dag", "artifacts"),
   ];
-  const artifactsDir = pickArtifactsDir(artifactsSearch);
+  const artifactsDir = pickArtifactsDir(compactPaths(artifactsSearch));
   const artifacts = artifactsDir
     ? loadArtifactsByModule(artifactsDir, workspaceRoot, errors)
     : new Map<string, ArtifactInput>();
+  mergeNodeStateArtifacts(nodeStateV2, artifacts, fileMtimeMs(nodeStateV2Path));
 
   const normalized = normalizeRunState({
     manifest,
@@ -167,9 +446,14 @@ export function loadRunState(args: {
   const telemetry = buildTelemetry(iterationSummary, runSummary);
 
   return {
+    graphMode,
     sourcePaths: {
       manifestPath: manifestPath ? toPortable(path.relative(workspaceRoot, manifestPath)) : null,
+      graphPath: graphPath ? toPortable(path.relative(workspaceRoot, graphPath)) : null,
       runSummaryPath: runSummaryPath ? toPortable(path.relative(workspaceRoot, runSummaryPath)) : null,
+      runSummaryV2Path: runSummaryV2Path ? toPortable(path.relative(workspaceRoot, runSummaryV2Path)) : null,
+      nodeStateV2Path: nodeStateV2Path ? toPortable(path.relative(workspaceRoot, nodeStateV2Path)) : null,
+      eventsPath: eventsPath ? toPortable(path.relative(workspaceRoot, eventsPath)) : null,
       artifactsDir: artifactsDir ? toPortable(path.relative(workspaceRoot, artifactsDir)) : null,
       iterationSummaryPath: iterationSummaryPath ? toPortable(path.relative(workspaceRoot, iterationSummaryPath)) : null,
     },
@@ -289,7 +573,7 @@ function loadArtifactsByModule(
     if (!moduleId) continue;
 
     const attempt = typeof raw?.attempt === "number" ? raw.attempt : parseAttemptFromFile(path.basename(filePath));
-    const status = toStatus(raw?.status);
+    const status = toModuleStatus(raw?.status);
     if (!status) continue;
 
     const artifact: ArtifactInput = {
@@ -331,10 +615,11 @@ function parseAttemptFromFile(fileName: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function toStatus(value: unknown): ArtifactInput["status"] | null {
+function toModuleStatus(value: unknown): ArtifactInput["status"] | null {
   if (value === "success" || value === "failed" || value === "blocked" || value === "skipped" || value === "pending") {
     return value;
   }
+  if (value === "ready" || value === "running") return "pending";
   return null;
 }
 

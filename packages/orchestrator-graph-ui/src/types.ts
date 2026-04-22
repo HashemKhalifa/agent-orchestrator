@@ -7,6 +7,9 @@ export interface NodeState {
   title: string;
   level: number;
   mode: "analyze" | "implement";
+  kind: "module" | "gate" | "policy";
+  entryGroup: string | null;
+  lockKeys: string[];
   dependsOn: string[];
   status: ModuleStatus;
   attempt?: number;
@@ -24,6 +27,9 @@ export interface EdgeRef {
   id: string;
   source: string;
   target: string;
+  kind: "depends_on" | "soft_depends_on" | "repair" | "policy_guard";
+  blocking: boolean;
+  rationale: string | null;
 }
 
 export interface RunHistoryEntry {
@@ -71,9 +77,14 @@ export interface RunTelemetry {
 
 export interface RunStateResponse {
   ok: boolean;
+  graphMode: "v1" | "v2" | "auto";
   sourcePaths: {
     manifestPath: string | null;
+    graphPath: string | null;
     runSummaryPath: string | null;
+    runSummaryV2Path: string | null;
+    nodeStateV2Path: string | null;
+    eventsPath: string | null;
     artifactsDir: string | null;
     iterationSummaryPath: string | null;
   };

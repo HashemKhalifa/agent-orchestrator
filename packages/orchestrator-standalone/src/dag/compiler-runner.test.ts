@@ -866,6 +866,7 @@ describe("request DAG compile/run", () => {
     const summary = await runDag({
       workspaceRoot: root,
       manifestPath: "generated/orchestration/dag/manifest.json",
+      executorProfile: "none",
       dryRun: false,
       timeoutMs: 1000,
       enableRepairLoop: true,

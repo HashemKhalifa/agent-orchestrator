@@ -1,16 +1,36 @@
 export type ModuleStatus = "success" | "failed" | "blocked" | "skipped" | "pending";
 export type RunStatus = "success" | "partial_failure" | "failure" | "unknown";
+export type NodeKind = "module" | "gate" | "policy";
+export type EdgeKind = "depends_on" | "soft_depends_on" | "repair" | "policy_guard";
 
 export interface ManifestModule {
   id: string;
   title: string;
+  description?: string;
   level: number;
   mode: "analyze" | "implement";
+  kind?: NodeKind;
+  entryGroup?: string | null;
+  lockKeys?: string[];
+  execution?: {
+    partPath?: string;
+    command?: string | null;
+  };
   dependsOn: string[];
 }
 
 export interface ManifestInput {
   modules: ManifestModule[];
+  edges?: EdgeInput[];
+}
+
+export interface EdgeInput {
+  id: string;
+  source: string;
+  target: string;
+  kind?: EdgeKind;
+  blocking?: boolean;
+  rationale?: string | null;
 }
 
 export interface RunResultInput {
@@ -51,6 +71,9 @@ export interface NodeState {
   title: string;
   level: number;
   mode: "analyze" | "implement";
+  kind: NodeKind;
+  entryGroup: string | null;
+  lockKeys: string[];
   dependsOn: string[];
   status: ModuleStatus;
   attempt?: number;
@@ -77,7 +100,14 @@ export interface NormalizedRunState {
     skippedCount: number;
   };
   nodes: NodeState[];
-  edges: Array<{ id: string; source: string; target: string }>;
+  edges: Array<{
+    id: string;
+    source: string;
+    target: string;
+    kind: EdgeKind;
+    blocking: boolean;
+    rationale: string | null;
+  }>;
 }
 
 export function normalizeRunState(args: {
@@ -109,6 +139,9 @@ export function normalizeRunState(args: {
       title: module.title,
       level: module.level,
       mode: module.mode,
+      kind: module.kind ?? inferNodeKind(module),
+      entryGroup: module.entryGroup ?? inferEntryGroup(module),
+      lockKeys: Array.isArray(module.lockKeys) ? module.lockKeys : [],
       dependsOn: module.dependsOn,
       status: source?.status ?? "pending",
       attempt: source?.attempt,
@@ -123,13 +156,26 @@ export function normalizeRunState(args: {
     };
   });
 
-  const edges = args.manifest.modules.flatMap((module) =>
+  const fallbackEdges = args.manifest.modules.flatMap((module) =>
     module.dependsOn.map((dep) => ({
-      id: `${dep}->${module.id}`,
+      id: `${dep}->${module.id}:depends_on`,
       source: dep,
       target: module.id,
+      kind: "depends_on" as const,
+      blocking: true,
+      rationale: "v1 dependsOn",
     })),
   );
+  const edges = Array.isArray(args.manifest.edges) && args.manifest.edges.length > 0
+    ? args.manifest.edges.map((edge) => ({
+      id: edge.id || `${edge.source}->${edge.target}:${edge.kind ?? "depends_on"}`,
+      source: edge.source,
+      target: edge.target,
+      kind: edge.kind ?? "depends_on",
+      blocking: edge.blocking ?? true,
+      rationale: edge.rationale ?? null,
+    }))
+    : fallbackEdges;
 
   const totalModules = nodes.length;
   const successCount = nodes.filter((node) => node.status === "success").length;
@@ -166,6 +212,26 @@ export function normalizeRunState(args: {
     nodes,
     edges,
   };
+}
+
+function inferNodeKind(module: ManifestModule): NodeKind {
+  const title = module.title.toLowerCase();
+  if (title.includes("policy")) return "policy";
+  if (
+    title.includes("gate") ||
+    title.includes("verify") ||
+    title.includes("validation") ||
+    title.includes("acceptance")
+  ) {
+    return "gate";
+  }
+  return "module";
+}
+
+function inferEntryGroup(module: ManifestModule): string | null {
+  if (module.kind === "policy" || module.kind === "gate") return "governance";
+  if (module.mode === "analyze") return "core-context";
+  return null;
 }
 
 function inferRunStatus(args: {

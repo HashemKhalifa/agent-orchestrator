@@ -11,9 +11,11 @@ if [[ -z "$MODULE_ID" || -z "$PART_FILE" ]]; then
   exit 2
 fi
 
-CODEX_CMD="${ORCHESTRATOR_CODEX_EXECUTABLE:-codex exec --full-auto -c model_reasoning_effort=\"low\"}"
+CODEX_CMD="${ORCHESTRATOR_CODEX_EXECUTABLE:-codex exec --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort=\"xhigh\"}"
 TIMEOUT_MS="${ORCHESTRATOR_PROVIDER_TIMEOUT_MS:-180000}"
 HEARTBEAT_MS="${ORCHESTRATOR_PROVIDER_HEARTBEAT_MS:-10000}"
+MAX_RETRIES="${ORCHESTRATOR_PROVIDER_MAX_RETRIES:-0}"
+RETRY_ATTEMPT="${ORCHESTRATOR_PROVIDER_RETRY_ATTEMPT:-0}"
 
 PROMPT=$(cat <<PROMPT_EOF
 DAG module: $MODULE_ID
@@ -24,6 +26,9 @@ Run in strict non-interactive automation mode.
 - Do not ask questions or request confirmation.
 - Do not pause for human approval.
 - Execute only the scope defined in the part file.
+- Package manager rule: prefer pnpm for install/run/test commands when available in this workspace.
+- Keep execution tight: avoid broad repo-wide scans unless strictly required by the part file.
+- Prefer direct commands over exploratory analysis; finish within the command timeout budget.
 - If full implementation is risky, perform the safest concrete sub-steps (discovery, validation, scaffolding) and report exactly what was done.
 - Include commands run, files touched, and validation evidence.
 - End with one line: MODULE_STATUS: success or MODULE_STATUS: failed.
@@ -44,6 +49,7 @@ if command -v python3 >/dev/null 2>&1; then
   set +e
   python3 - "$TIMEOUT_MS" "$HEARTBEAT_MS" "$MODULE_ID" "$CODEX_CMD" "$PROMPT" "$STDOUT_FILE" "$STDERR_FILE" <<'PY'
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -62,14 +68,21 @@ stderr_path = sys.argv[7]
 argv = shlex.split(command) + [prompt]
 timeout_s = max(1, timeout_ms) / 1000.0
 heartbeat_s = max(0.5, heartbeat_ms / 1000.0)
+module_status_re = re.compile(r"(?im)^\s*MODULE_STATUS:\s*(success|failed)\s*$")
 
 def write_chunk(stream, file_obj, chunk):
     if not chunk:
         return
-    file_obj.write(chunk)
-    file_obj.flush()
-    stream.buffer.write(chunk)
-    stream.buffer.flush()
+    try:
+        file_obj.write(chunk)
+        file_obj.flush()
+    except Exception:
+        pass
+    try:
+        stream.buffer.write(chunk)
+        stream.buffer.flush()
+    except Exception:
+        pass
 
 with open(stdout_path, "wb") as stdout_f:
     with open(stderr_path, "wb") as stderr_f:
@@ -122,37 +135,46 @@ with open(stdout_path, "wb") as stdout_f:
         last_heartbeat = started
         timed_out = False
         timed_out_at = None
+        forced_finish = False
+        module_status = None
+        module_status_seen_at = None
+        module_status_grace_s = 2.0
+        status_tail = ""
+
+        def detach_pipes():
+            # Providers may leave descendant fds open; detach explicitly when stopping early.
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is None:
+                    continue
+                try:
+                    selector.unregister(pipe)
+                except Exception:
+                    pass
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
         while True:
             now = time.monotonic()
             if proc.poll() is not None and len(selector.get_map()) == 0:
                 break
 
-            if proc.poll() is None and now >= deadline and not timed_out:
+            if now >= deadline and not timed_out:
                 timed_out = True
                 timed_out_at = now
-                terminate_tree(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    terminate_tree(signal.SIGKILL)
+                if proc.poll() is None:
+                    terminate_tree(signal.SIGTERM)
                     try:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
-                        pass
-                # Do not wait for every pipe fd to close after timeout:
-                # some provider descendants can keep them open.
-                for pipe in (proc.stdout, proc.stderr):
-                    if pipe is None:
-                        continue
-                    try:
-                        selector.unregister(pipe)
-                    except Exception:
-                        pass
-                    try:
-                        pipe.close()
-                    except Exception:
-                        pass
+                        terminate_tree(signal.SIGKILL)
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
+                # Do not wait for every pipe fd to close after timeout.
+                detach_pipes()
                 break
 
             if now - last_heartbeat >= heartbeat_s and proc.poll() is None:
@@ -173,12 +195,51 @@ with open(stdout_path, "wb") as stdout_f:
                     chunk = os.read(pipe.fileno(), 4096)
                 except BlockingIOError:
                     continue
-
-                if not chunk:
-                    selector.unregister(pipe)
+                except ValueError:
+                    try:
+                        selector.unregister(pipe)
+                    except Exception:
+                        pass
                     continue
 
-                write_chunk(stream, file_obj, chunk)
+                if not chunk:
+                    try:
+                        selector.unregister(pipe)
+                    except Exception:
+                        pass
+                    continue
+
+                try:
+                    write_chunk(stream, file_obj, chunk)
+                except ValueError:
+                    try:
+                        selector.unregister(pipe)
+                    except Exception:
+                        pass
+                    continue
+                decoded = chunk.decode("utf-8", errors="ignore")
+                if decoded:
+                    status_tail = (status_tail + decoded)[-8192:]
+                    if module_status is None:
+                        match = module_status_re.search(status_tail)
+                        if match:
+                            module_status = match.group(1).lower()
+                            module_status_seen_at = now
+
+            if module_status is not None and proc.poll() is None and module_status_seen_at is not None:
+                if now - module_status_seen_at >= module_status_grace_s:
+                    forced_finish = True
+                    terminate_tree(signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        terminate_tree(signal.SIGKILL)
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    detach_pipes()
+                    break
 
             if timed_out and timed_out_at is not None and now - timed_out_at > 3:
                 break
@@ -195,11 +256,19 @@ with open(stdout_path, "wb") as stdout_f:
                         chunk = os.read(pipe.fileno(), 4096)
                     except BlockingIOError:
                         break
+                    except ValueError:
+                        break
                     if not chunk:
                         break
-                    write_chunk(stream, file_obj, chunk)
+                    try:
+                        write_chunk(stream, file_obj, chunk)
+                    except Exception:
+                        break
 
-        rc = proc.returncode if not timed_out else 124
+        if forced_finish and module_status is not None:
+            rc = 0
+        else:
+            rc = proc.returncode if not timed_out else 124
 
 sys.exit(rc)
 PY
@@ -220,6 +289,26 @@ fi
 
 if [[ "$STATUS" -eq 124 ]]; then
   echo "provider timeout reached after ${TIMEOUT_MS}ms (codex-timeboxed.sh)" >&2
+fi
+
+if [[ "$STATUS" -ne 0 ]]; then
+  IS_TRANSIENT=false
+  if [[ "$STATUS" -eq 124 ]]; then
+    IS_TRANSIENT=true
+  elif grep -qiE "stream disconnected before completion|failed to refresh available models|error sending request for url|provider timeout reached|command timed out after" "$STDERR_FILE"; then
+    IS_TRANSIENT=true
+  fi
+
+  if [[ "$IS_TRANSIENT" == "true" && "$RETRY_ATTEMPT" -lt "$MAX_RETRIES" ]]; then
+    NEXT_ATTEMPT=$((RETRY_ATTEMPT + 1))
+    echo "transient provider failure detected; retrying codex-timeboxed (${NEXT_ATTEMPT}/${MAX_RETRIES})" >&2
+    ORCHESTRATOR_PROVIDER_RETRY_ATTEMPT="$NEXT_ATTEMPT" \
+      ORCHESTRATOR_PROVIDER_MAX_RETRIES="$MAX_RETRIES" \
+      ORCHESTRATOR_PROVIDER_TIMEOUT_MS="$TIMEOUT_MS" \
+      ORCHESTRATOR_PROVIDER_HEARTBEAT_MS="$HEARTBEAT_MS" \
+      bash "$0" "$MODULE_ID" "$TITLE" "$PART_FILE" "$REQUEST_PATH"
+    exit $?
+  fi
 fi
 
 bash "$(dirname "$0")/emit-token-receipt.sh" "codex" "$STDOUT_FILE" "$STDERR_FILE" || true

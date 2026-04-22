@@ -19,7 +19,7 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/run-state", (req, res) => {
   try {
-    res.json(buildRunStateResponse(req.query.workspaceRoot, req.query.autonomyDir));
+    res.json(buildRunStateResponse(req.query.workspaceRoot, req.query.autonomyDir, req.query.mode, req.query.runId));
   } catch (error) {
     res.status(500).json(toRunStateErrorResponse(error));
   }
@@ -29,6 +29,8 @@ app.get("/api/stream", (req, res) => {
   const intervalMs = clampIntervalMs(readQueryNumber(req.query.intervalMs));
   const workspaceRootValue = req.query.workspaceRoot;
   const autonomyDirValue = req.query.autonomyDir;
+  const modeValue = req.query.mode;
+  const runIdValue = req.query.runId;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -37,7 +39,7 @@ app.get("/api/stream", (req, res) => {
 
   const writePayload = () => {
     try {
-      const payload = buildRunStateResponse(workspaceRootValue, autonomyDirValue);
+      const payload = buildRunStateResponse(workspaceRootValue, autonomyDirValue, modeValue, runIdValue);
       res.write(`event: run-state\n`);
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     } catch (error) {
@@ -84,17 +86,27 @@ function clampIntervalMs(value: number | null): number {
   return Math.max(500, Math.min(10000, Math.round(value)));
 }
 
-function buildRunStateResponse(workspaceRootValue: unknown, autonomyDirValue: unknown) {
+function buildRunStateResponse(
+  workspaceRootValue: unknown,
+  autonomyDirValue: unknown,
+  modeValue: unknown,
+  runIdValue: unknown,
+) {
   const workspaceRootInput = readQueryString(workspaceRootValue);
   const autonomyDirInput = readQueryString(autonomyDirValue);
+  const modeInput = readQueryString(modeValue);
+  const runIdInput = readQueryString(runIdValue);
   const state = loadRunState({
     repoRoot,
     workspaceRootInput,
     autonomyDirInput,
+    modeInput,
+    runIdInput,
   });
 
   return {
     ok: true,
+    graphMode: state.graphMode,
     sourcePaths: state.sourcePaths,
     run: state.run,
     nodes: state.nodes,
@@ -110,9 +122,14 @@ function toRunStateErrorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   return {
     ok: false,
+    graphMode: "auto",
     sourcePaths: {
       manifestPath: null,
+      graphPath: null,
       runSummaryPath: null,
+      runSummaryV2Path: null,
+      nodeStateV2Path: null,
+      eventsPath: null,
       artifactsDir: null,
       iterationSummaryPath: null,
     },

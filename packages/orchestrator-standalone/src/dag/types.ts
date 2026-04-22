@@ -8,6 +8,8 @@ export const DagModuleSchema = z.object({
   description: z.string().trim().min(1),
   partPath: z.string().trim().min(1),
   mode: z.enum(["analyze", "implement"]).default("implement"),
+  kind: z.enum(["module", "gate", "policy"]).optional(),
+  entryGroup: z.string().trim().min(1).optional(),
   level: z.number().int().nonnegative(),
   dependsOn: z.array(z.string().trim().min(1)).default([]),
   resources: z.array(z.string().trim().min(1)).default([]),
@@ -164,6 +166,9 @@ export const DagMemoryRevisitSummarySchema = z.object({
 });
 
 export const DagRunSummarySchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  graphMode: z.enum(["v1", "v2", "auto"]).optional(),
+  eventsPath: z.string().trim().min(1).nullable().default(null),
   manifestPath: z.string(),
   startedAt: z.string(),
   completedAt: z.string(),

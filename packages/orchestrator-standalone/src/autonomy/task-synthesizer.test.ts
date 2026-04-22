@@ -119,4 +119,79 @@ describe("synthesizeTaskRequest", () => {
     expect(content).toContain("Replay memory suggestions:");
     expect(content).toContain("Refined Top Hits");
   });
+
+  it("injects workspace readiness task from recipe preconditions and gate commands", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "orchestrator-task-synth-readiness-"));
+    cleanup.push(root);
+
+    writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({
+        name: "demo",
+        version: "1.0.0",
+        scripts: {
+          test: "echo ok",
+        },
+      }),
+      "utf8",
+    );
+
+    const result = synthesizeTaskRequest({
+      workspaceRoot: root,
+      goalType: "custom",
+      recipeId: "custom-readiness",
+      recipe: {
+        id: "custom-readiness",
+        version: "1.0.0",
+        title: "Custom readiness check",
+        description: "Validate readiness task inference",
+        goalType: "custom",
+        defaultWaveStrategy: "custom",
+        preconditions: {
+          packageManagers: ["pnpm"],
+          requiresFiles: ["package.json", "tsconfig.json"],
+          requiresBuildTools: ["webpack"],
+        },
+        discoverySources: [
+          {
+            id: "source",
+            title: "Source",
+            url: "https://example.com/source",
+            type: "primary",
+            tags: [],
+          },
+        ],
+        riskProbes: [],
+        steps: [
+          {
+            id: "step-1",
+            title: "Implement",
+            kind: "transform",
+            description: "Do something",
+            mutating: true,
+          },
+        ],
+        gates: [
+          {
+            id: "gate-typecheck",
+            title: "Typecheck passes",
+            kind: "command",
+            required: true,
+            command: "pnpm run typecheck",
+          },
+        ],
+        rollbackHints: [],
+        edgeCases: [],
+      },
+      outputPath: "generated/autonomy/request.readiness.md",
+      maxTasks: 12,
+    });
+
+    const content = readFileSync(result.requestPath, "utf8");
+    expect(content).toContain("Task 01: Workspace readiness bootstrap");
+    expect(content).toContain("node_modules/.bin");
+    expect(content).toContain("tsconfig.json");
+    expect(content).toContain("webpack");
+    expect(content).toContain("typecheck");
+  });
 });

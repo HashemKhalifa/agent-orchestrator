@@ -9,6 +9,12 @@ import {
   type DagModule,
   type SplitPart,
 } from "./types.js";
+import {
+  GraphModeSchema,
+  graphV2ToManifestV1,
+  manifestV1ToGraphV2,
+  type GraphV2RecipeContext,
+} from "./graph-v2.js";
 
 function ensureDir(dirPath: string): void {
   mkdirSync(dirPath, { recursive: true });
@@ -129,9 +135,9 @@ function inferMode(kind: PartKind): "analyze" | "implement" {
 }
 
 function assignDependencies(args: {
-  modules: Array<DagModule & { kind: PartKind }>;
+  modules: Array<DagModule & { partKind: PartKind }>;
   mode: DagDependencyMode;
-}): Array<DagModule & { kind: PartKind }> {
+}): Array<DagModule & { partKind: PartKind }> {
   if (args.mode === "parallel") {
     return args.modules.map((module) => ({ ...module, dependsOn: [], level: 0 }));
   }
@@ -144,28 +150,49 @@ function assignDependencies(args: {
     }));
   }
 
-  const preambleIds = args.modules.filter((module) => module.kind === "preamble").map((module) => module.id);
-  const streamIds = args.modules.filter((module) => module.kind === "stream").map((module) => module.id);
+  const preambleByKind = args.modules.filter((module) => module.partKind === "preamble").map((module) => module.id);
+  const streamByKind = args.modules.filter((module) => module.partKind === "stream").map((module) => module.id);
 
   return args.modules.map((module) => {
-    if (module.kind === "preamble") {
+    if (module.partKind === "preamble") {
       return { ...module, dependsOn: [], level: 0 };
     }
 
-    if (module.kind === "stream") {
+    if (module.partKind === "stream") {
       return {
         ...module,
-        dependsOn: [...preambleIds],
-        level: preambleIds.length > 0 ? 1 : 0,
+        dependsOn: [...preambleByKind],
+        level: preambleByKind.length > 0 ? 1 : 0,
       };
     }
 
     return {
       ...module,
-      dependsOn: Array.from(new Set([...preambleIds, ...streamIds])),
-      level: (preambleIds.length > 0 ? 1 : 0) + (streamIds.length > 0 ? 1 : 0),
+      dependsOn: Array.from(new Set([...preambleByKind, ...streamByKind])),
+      level: (preambleByKind.length > 0 ? 1 : 0) + (streamByKind.length > 0 ? 1 : 0),
     };
   });
+}
+
+function inferNodeKind(args: { partKind: PartKind; title: string }): "module" | "gate" | "policy" {
+  const title = args.title.toLowerCase();
+  if (title.includes("policy")) return "policy";
+  if (
+    args.partKind === "postamble" ||
+    title.includes("gate") ||
+    title.includes("verify") ||
+    title.includes("validation") ||
+    title.includes("acceptance")
+  ) {
+    return "gate";
+  }
+  return "module";
+}
+
+function inferEntryGroup(args: { partKind: PartKind; title: string }): string {
+  if (args.partKind === "preamble") return "core-context";
+  if (args.partKind === "postamble") return "governance";
+  return `workstream:${slug(args.title)}`;
 }
 
 function writeParts(args: {
@@ -209,10 +236,14 @@ export async function compileRequestDag(args: {
   requestPath: string;
   outputDir: string;
   dependencyMode: DagDependencyMode;
+  graphMode?: "v1" | "v2" | "auto";
+  recipeContext?: GraphV2RecipeContext;
   name?: string;
   description?: string;
 }): Promise<DagManifest> {
   const dependencyMode = DagDependencyModeSchema.parse(args.dependencyMode);
+  const requestedGraphMode = GraphModeSchema.parse(args.graphMode ?? "auto");
+  const resolvedGraphMode = requestedGraphMode === "auto" ? "v1" : requestedGraphMode;
   const requestPathAbs = path.resolve(args.workspaceRoot, args.requestPath);
   const outputDirAbs = path.resolve(args.workspaceRoot, args.outputDir);
   const partsDirAbs = path.join(outputDirAbs, "parts");
@@ -246,28 +277,36 @@ export async function compileRequestDag(args: {
   });
 
   const draftModules = writtenParts.map((part) => {
-    const kind = classifyPart(part.title);
+    const partKind = classifyPart(part.title);
     const titleSlug = slug(part.title);
+    const nodeKind = inferNodeKind({ partKind, title: part.title });
+    const entryGroup = inferEntryGroup({ partKind, title: part.title });
     return {
       id: `${String(part.index).padStart(2, "0")}-${titleSlug}`,
       title: part.title,
       description: `Request chunk ${String(part.index).padStart(2, "0")}: ${part.title}`,
       partPath: path.relative(args.workspaceRoot, part.partPath).replace(/\\/g, "/"),
-      mode: inferMode(kind),
+      mode: inferMode(partKind),
+      ...(resolvedGraphMode === "v2"
+        ? {
+          kind: nodeKind,
+          entryGroup,
+        }
+        : {}),
       level: 0,
       dependsOn: [],
       resources: [],
-      kind,
+      partKind,
     };
   });
 
   const modules = assignDependencies({
     modules: draftModules,
     mode: dependencyMode,
-  }).map(({ kind: _kind, ...module }) => module);
+  }).map(({ partKind: _partKind, ...module }) => module);
 
   ensureDir(outputDirAbs);
-  const manifest = DagManifestSchema.parse({
+  const manifestV1 = DagManifestSchema.parse({
     schemaVersion: "1.0",
     name: args.name ?? "request-orchestration-dag",
     description:
@@ -280,6 +319,17 @@ export async function compileRequestDag(args: {
   });
 
   const manifestPath = path.join(outputDirAbs, "manifest.json");
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  return manifest;
+
+  if (resolvedGraphMode === "v2") {
+    const graph = manifestV1ToGraphV2(manifestV1, args.recipeContext);
+    const graphPath = path.join(outputDirAbs, "graph.json");
+    writeFileSync(graphPath, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+
+    const projectedManifest = graphV2ToManifestV1(graph);
+    writeFileSync(manifestPath, `${JSON.stringify(projectedManifest, null, 2)}\n`, "utf8");
+    return projectedManifest;
+  }
+
+  writeFileSync(manifestPath, `${JSON.stringify(manifestV1, null, 2)}\n`, "utf8");
+  return manifestV1;
 }

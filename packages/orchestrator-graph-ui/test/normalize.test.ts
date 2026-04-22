@@ -31,7 +31,10 @@ describe("normalizeRunState", () => {
     expect(state.run.cursorStep).toBe(1);
     expect(state.run.totalModules).toBe(3);
     expect(state.nodes.map((node) => node.status)).toEqual(["pending", "pending", "pending"]);
-    expect(state.edges.map((edge) => edge.id)).toEqual(["01-objective->02-plan", "02-plan->03-apply"]);
+    expect(state.edges.map((edge) => edge.id)).toEqual([
+      "01-objective->02-plan:depends_on",
+      "02-plan->03-apply:depends_on",
+    ]);
   });
 
   it("prefers newer artifact data over run-summary result for each module", () => {

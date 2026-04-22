@@ -4,20 +4,27 @@ import {
   type GateDefinition,
 } from "../spec/schemas.js";
 
+const DEFAULT_TYPECHECK_GATE_COMMAND =
+  "bash -lc 'if pnpm -s run | grep -q \" type-check\"; then pnpm run type-check; elif pnpm -s run | grep -q \" typecheck\"; then pnpm run typecheck; elif npm -s run | grep -q \" type-check\"; then npm run type-check; elif npm -s run | grep -q \" typecheck\"; then npm run typecheck; else echo \"No typecheck script (expected type-check or typecheck)\" >&2; exit 1; fi'";
+const DEFAULT_TEST_GATE_COMMAND =
+  "bash -lc 'if pnpm -s run | grep -q \" test:run\"; then pnpm run test:run; elif pnpm -s run | grep -q \" test\"; then pnpm test; elif npm -s run | grep -q \" test:run\"; then npm run test:run; elif npm -s run | grep -q \" test\"; then npm test; else echo \"No test script (expected test:run or test)\" >&2; exit 1; fi'";
+const DEFAULT_SMOKE_DEV_HELP_COMMAND =
+  "bash -lc 'if pnpm -s run | grep -q \" dev\"; then pnpm run dev -- --help; elif npm -s run | grep -q \" dev\"; then npm run dev -- --help; else echo \"No dev script\" >&2; exit 1; fi'";
+
 const DEFAULT_GATES: GateDefinition[] = [
   {
     id: "gate-typecheck",
     title: "Typecheck passes",
     kind: "command",
     required: true,
-    command: "npm run typecheck",
+    command: DEFAULT_TYPECHECK_GATE_COMMAND,
   },
   {
     id: "gate-tests",
     title: "Tests pass",
     kind: "command",
     required: true,
-    command: "npm run test:run",
+    command: DEFAULT_TEST_GATE_COMMAND,
   },
   {
     id: "gate-high-risk",
@@ -252,7 +259,7 @@ const RECIPES: ExecutionRecipe[] = [
         title: "Smoke test command passes",
         kind: "command",
         required: false,
-        command: "npm run dev -- --help",
+        command: DEFAULT_SMOKE_DEV_HELP_COMMAND,
         note: "Optional by default because monorepo apps often use custom runner commands.",
       },
     ],
